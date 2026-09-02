@@ -1,0 +1,363 @@
+## 六个包组成的主干
+
+一次 turn 在这六个包里流转一圈。它们是**每一种组合都会启动**的包。
+
+<DataTable
+  head={['包', '拥有什么', 'ctx key']}
+  rows={[
+    ['core/session', '仅追加的 SessionEvent 日志与内存 store——唯一真相', 'ctx.sessions'],
+    ['core/system-prompt', '提示段落与工具 schema 的装配', 'ctx.systemPrompt'],
+    ['core/tools', '按 scope 划分的工具注册表，以及带检查点的执行管线', 'ctx.tools'],
+    ['core/agent', 'Agent 接口、活注册表、initiator 作用域、agent/* 事件词汇', 'ctx.agents'],
+    ['core/agent-loop', '实现公开 Agent 契约的具体驱动', 'ctx.agentLoop'],
+    ['core/scope', 'per-agent 作用域注册原语', '库，无 key'],
+  ]}
+/>
+
+<Callout variant="key" title="scope 是唯一的非服务包">
+  它是一个<strong>零依赖库</strong>（<code>createScope</code> / <code>scopeOf</code> /{' '}
+  <code>scopeTarget</code>），在模块图里放在 <code>session/</code> 与{' '}
+  <code>system-prompt/</code> <strong>下方</strong>，好让后两者能消费它而不形成环。
+</Callout>
+
+<Figure
+  kind="数据流"
+  scroll
+  title="一次 turn 在六个包里的流转"
+  caption={
+    <>
+      循环搬运的对话词汇——<code>Message</code>、<code>ContentBlock</code>、
+      <code>StreamChunk</code>、模型请求——是由 <code>packages/llm</code> 声明的，不属于 core。
+    </>
+  }
+>
+  <Flow
+    nodes={[
+      { title: 'agent-loop', sub: 'claim 排队的 prompt', kind: 'service', tone: 'accent' },
+      { title: 'session', sub: 'ctx.sessions', kind: 'store', tone: 'lime', edge: '开启 turn' },
+      { title: 'system-prompt', sub: 'ctx.systemPrompt', kind: 'service', tone: 'violet', edge: '装配前缀' },
+      { title: 'deriveMessages()', note: '从日志算出消息历史', kind: 'plain', tone: 'lime', edge: '算出历史' },
+      { title: 'LLM seam', sub: 'ctx.llm', kind: 'model', tone: 'violet', edge: '流式' },
+      { title: 'tools', sub: 'ctx.tools', kind: 'service', tone: 'rose', edge: '派发调用' },
+      { title: '追加回日志', sub: '模型看得见的事实', kind: 'store', tone: 'accent', edge: '下一步据此再算' },
+    ]}
+  />
+</Figure>
+
+<Callout variant="rule" title="扩展插件依赖 agent，不要直接依赖 agent-loop">
+  即使需要拿到 initiating Agent，也依赖 <code>agent</code>。这条约束让循环保持可替换。
+  <code>agent-loop</code> 之所以放在 core，是因为它是 harness 的默认产品循环，而不是因为它有特权。
+</Callout>
+
+## 服务地图
+
+<Cards
+  cols={2}
+  items={[
+    {
+      title: '会话与历史',
+      meta: 'ctx.sessions · ctx.sessionProjections · ctx.sessionPersistence · ctx.sessionQuery',
+      tone: 'accent',
+      body: '日志、projection 单元、持久化 seam、查询与检索。所有关于「发生了什么」的问题都在这里。',
+    },
+    {
+      title: '模型与上下文',
+      meta: 'ctx.llm · ctx.systemPrompt · ctx.tokenMeter · ctx.compaction',
+      tone: 'violet',
+      body: '适配器 seam、提示装配、token 计量、压缩。所有关于「模型看到什么」的问题都在这里。',
+    },
+    {
+      title: '能力与执行',
+      meta: 'ctx.tools · ctx.shell · ctx.fs · ctx.subprocess · ctx.terminals · ctx.sandbox · ctx.lsp · ctx.web',
+      tone: 'lime',
+      body: '工具注册表与它下面的执行世界。所有关于「模型能做什么」的问题都在这里。',
+    },
+    {
+      title: 'Agent 与编排',
+      meta: 'ctx.agents · ctx.agentLoop · ctx.subagents · ctx.jobs · ctx.goals · ctx.workflowEngine',
+      tone: 'amber',
+      body: '活的 agent 句柄、循环驱动、委派、后台作业、目标与工作流。',
+    },
+    {
+      title: '人机交互',
+      meta: 'ctx.approval · ctx.userQuestions · ctx.commands · ctx.permissionPresets · ctx.planMode',
+      tone: 'rose',
+      body: '审批、提问、人类命令、权限预设、计划模式。ctx.commands 的分发不经过模型 turn。',
+    },
+    {
+      title: '配置与身份',
+      meta: 'ctx.settings · ctx.credentials · ctx.authorization · ctx.storage · ctx.agentPresets',
+      tone: 'accent',
+      body: '分层设置、凭据引用、授权流程、非会话存储、per-session agent 组合。',
+    },
+  ]}
+/>
+
+## 三个事件域
+
+<Figure
+  kind="对照表"
+  title="选对事件域是绝大多数改动的第一个决定"
+  caption={
+    <>
+      <code>docs/event-producer-consumer.md</code> 列出每个事件的生产者与消费者。turn 与 step 的边界是<strong>持久会话事件</strong>，不是 agent emit。
+    </>
+  }
+>
+  <Matrix
+    corner="域"
+    cols={['判据', '例子', '什么时候用']}
+    rows={[
+      {
+        label: '会话事件',
+        cells: [
+          { label: '追加到日志并通过 session/event 广播的持久事实', tone: 'accent' },
+          { label: 'turn/start · user/message · tool/result', tone: 'neutral' },
+          { label: '当这个事实必须在重载后仍然存在', tone: 'accent' },
+        ],
+      },
+      {
+        label: 'Agent 事件',
+        cells: [
+          { label: '携带一个活的 Agent：inbox、step、status、request、校验、续跑', tone: 'violet' },
+          { label: 'agent/pre-step · agent/status · agent/turn-stopping', tone: 'neutral' },
+          { label: '当你要观察或拦截飞行中的工作', tone: 'violet' },
+        ],
+      },
+      {
+        label: '能力事件',
+        cells: [
+          { label: '把策略与适配器挂到一个 seam 上，且不导入循环', tone: 'lime' },
+          { label: 'fs/* · tools/* · telemetry/*', tone: 'neutral' },
+          { label: '当你要给某个能力加策略', tone: 'lime' },
+        ],
+      },
+    ]}
+  />
+</Figure>
+
+## Agent 句柄
+
+`Agent` 是每个插件（UI、hook、编排器）编程面对的接口。`ctx.agents.get(id)` 返回它，initiator 作用域携带它。**具体实现是 dsh-agent-loop 的包内私有**，循环之外没有任何东西依赖它。
+
+<DefList
+  items={[
+    { term: 'id', sig: 'SessionId', desc: 'Agent 身份以会话为准。' },
+    { term: 'options', sig: 'AgentOptions', desc: '这个 agent 的请求使用的 provider 路由与模型。' },
+    { term: 'session', sig: 'Session', desc: '它驱动的活会话；这条日志是持久真相。' },
+    { term: 'inbox', sig: 'Inbox', desc: 'agent 自己那份待处理工作的视图，从持久日志算出来。' },
+    { term: 'status', sig: "'idle' | 'running'", desc: '在每一次 agent/status 迁移上镜像出来的当前生命周期状态。' },
+    {
+      term: 'ctx',
+      sig: 'Context',
+      desc: 'agent 自己的 context；通过它注册的东西只这个 agent 看得见，dispose 时会逐一撤销，之后再注册会被拒绝。',
+    },
+    {
+      term: 'send(message, target, wakeup)',
+      sig: 'void',
+      desc: '统一的投递方法，直接暴露目标与唤醒路由。followup / steer / inject 都是它的固定预设别名。',
+    },
+    { term: 'cancel(cause, options?)', sig: 'void', desc: '清掉排队与 steering 工作（除非 keepInbox），并中止活的 turn 或 turn 间任务。第一个 cause 胜出。' },
+    { term: 'whenIdle()', sig: 'Promise<void>', desc: '在整个 agent 的活动达到静止后解析。它观察整个 agent，不标识任何一条消息的结算。' },
+    { term: 'runMaintenance(task)', sig: 'Promise<T>', desc: '在真正的空闲阶段跑一个非 turn 的维护任务；期间公开状态仍是 idle。' },
+  ]}
+/>
+
+<Callout variant="trap" title="running 不证明有一个打开的 turn">
+  <code>running</code> 描述的是<strong>驱动正在把工作处理完的那段时间</strong>，可以横跨连续排队的 turn。
+  dispose 会把 agent 从注册表移除并发出 <code>agent/disposed</code>——它<strong>不是</strong>第三种状态值。
+</Callout>
+
+## 三种投递方式的精确语义
+
+<Figure
+  kind="状态图"
+  title="followup / steer / inject 的区别只在目标与唤醒"
+  caption={
+    <>
+      三者都是 <code>send(message, target, wakeup)</code> 的固定预设。inbox 是两条有序的待处理消息列表，agent 拿着的是从持久日志算出来的视图。
+    </>
+  }
+>
+  <Matrix
+    corner="方法"
+    cols={['inbox 目标', '是否唤醒', '语义要点']}
+    rows={[
+      {
+        label: 'followup(message)',
+        cells: [
+          { label: "'next-turn'", tone: 'accent' },
+          { label: '是', tone: 'lime' },
+          { label: '这条消息成为它自己那个 turn 里唯一的普通消息', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'steer(message)',
+        cells: [
+          { label: "'next-step'", tone: 'violet' },
+          { label: '是', tone: 'lime' },
+          { label: '空闲驱动会开一个 turn；运行中的驱动在下一个 step 边界消费它', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'inject(message)',
+        cells: [
+          { label: "'next-step'", tone: 'violet' },
+          { label: '否', tone: 'amber' },
+          { label: '空闲驱动会让它一直挂着，直到 followup 或 steering 把驱动叫起来', tone: 'neutral' },
+        ],
+      },
+    ]}
+  />
+</Figure>
+
+<Callout variant="warn" title="inject 可能错过一次请求">
+  如果某次请求的 pre-step <strong>已经 claim 了它的批次</strong>，注入的上下文就会错过这次请求，等到下一个 step 边界。
+  取消或 dispose 也可能丢弃挂起的上下文。
+</Callout>
+
+`Inbox` 的 `append`、`prepend`、`replace`、`remove`、`clear`、`splice`、`claim` 都会记录规范化的持久 `agent/inbox/spliced` 变更，并拒绝重复的 pending id。`claim(target)` 通过**纯删除 splice** 移除提议的 step 批次——所有 `next-step` 输入，加上在 turn 边界时的一条 `next-turn` 消息——并且**不发 discarded 通知**；per-message 的 claimed 通知由循环单独发出。
+
+## 取消：cause 是类型化的同进程输入
+
+```ts
+/** Why an active agent driver was cancelled. */
+type AgentCancelCause =
+  | { readonly kind: 'user' }
+  | { readonly kind: 'parent' }
+  | { readonly kind: 'hook'; readonly reason: string }
+  | { readonly kind: 'disposed' }
+```
+
+<Callout variant="rule" title="signal 不授予分类权">
+  持有取消权的一方把 cause 拷进仅运行时的 <code>AbortSignal.reason</code>；
+  <strong>signal 不负责给协作监听器分类</strong>。持久的 <code>turn/end</code> 把结果记为{' '}
+  <code>{"{ kind: 'aborted', reason: TurnEndCancelCause }"}</code>，于是取消原因落在终态结果里。
+</Callout>
+
+`cancel` 的 `keepInbox` 选项保留排队与 steering 项：活的 turn 仍会被中止，但未开始的与挂起的工作会为后面的 turn 存活下来，并且**不记录取消性的 inbox splice**。
+
+## 拦截决策
+
+<Figure
+  kind="生命周期"
+  title="三个拦截点的返回类型"
+  caption={
+    <>
+      pre-step 决策使用与持久 user-role 输入<strong>同一个</strong>已标识的 <code>UserMessage</code> 类型。
+      进入的批次说了算，并保留每条消息的 <code>id</code> 与 <code>source</code>；hook 桥把它们的原生决策字段映射到这个类型化结果上。
+    </>
+  }
+>
+  <Pipeline
+    stages={[
+      {
+        title: 'agent/pre-step',
+        sub: 'waterfall · 算出请求之前唯一的监听器链',
+        tone: 'amber',
+        body: (
+          <>
+            载荷携带独占的已 claim 批次（<code>messages</code>）、提议 step 的坐标（
+            <code>turn</code>、<code>step</code>）与当前 turn 的取消 <code>signal</code>。
+          </>
+        ),
+        branches: [
+          { label: "{ kind: 'reject' }", to: '不开启任何 step', tone: 'rose' },
+          { label: "{ kind: 'enter', messages, startsRequestSeries? }", to: 'step/start 之后追加这批消息', tone: 'lime' },
+        ],
+      },
+      {
+        title: 'agent/request-error',
+        sub: 'waterfall · 失败 step 关闭之后、turn 关闭之前',
+        tone: 'violet',
+        body: '监听器可以在失败 turn 的 signal 仍然活着时修复持久状态或等待策略工作。',
+        branches: [
+          { label: "{ kind: 'retry' }（不调用 next）", to: '由这个监听器接管恢复', tone: 'lime' },
+          { label: 'undefined（默认）', to: '失败保持终态', tone: 'rose' },
+        ],
+      },
+      {
+        title: 'agent/turn-stopping',
+        sub: 'serial · turn 没有工具或 steering 续跑时',
+        tone: 'rose',
+        body: (
+          <>
+            在边界提交之前被 await。有异议的监听器就去 <code>agent.steer(...)</code>，机器随后重读 inbox：有新 steering 就再跑一个 step，没有就关闭 turn。
+            <strong>数据说话，所以监听器顺序改变不了结果。</strong>
+          </>
+        ),
+      },
+    ]}
+  />
+</Figure>
+
+反向控制（提前停掉一个工具循环）同样是数据：一个携带 `concludesTurn` 的工具结果会在它所在的 step 结束这个 turn。但这个结论**不会跳过已经提交的 next-step 工作**——同 step 的 `additionalContexts` 或竞态到达的 steering 仍会运行，turn 只在 inbox 处理完之后才关闭。
+
+## Agent 的创建与所有权
+
+```ts
+/**
+ * An owned agent plus its disposer, returned by AgentRegistry.create() / resume().
+ * The disposer is a CAPABILITY: among consumers, only the holder can tear this agent down.
+ */
+interface AgentHandle {
+  agent: Agent
+  dispose(): Promise<void>
+}
+```
+
+<Callout variant="key" title="disposer 是一种能力">
+  在消费者之间，<strong>只有持有者</strong>能拆掉这个 agent。注册的 factory provider 也是结构性 owner，因为挂在某个 scope 上的 agent 依赖那个 provider 的服务 API——provider 卸载会停止并等它创建的每个活句柄结束。
+</Callout>
+
+`setup` 回调（`AgentSetup`）在两个 id 都还未发布时组合出 agent 的作用域世界：通过 `agentCtx` 注册的一切都在 `agent/created` 与第一次提示装配**之前**就存在。setup 拒绝、commit 抛错或 owner dispose 都会把这次事务回滚，两个 id 都不发布。
+
+## initiating Agent
+
+`ctx.agents` 携带的进程本地 initiator **就是**上面那个 `Agent`，不是另一个 frame，也不是被拷贝的身份。
+
+<Callout variant="warn" title="环境里存在 initiator 既不证明活性也不构成授权">
+  它的生命期与作用域规则由 initiator-scope 决策定义。<code>agent-loop</code> 把每个驱动跑在{' '}
+  <code>ctx.agents.withInitiator()</code> 里面。
+</Callout>
+
+## scope：per-agent 的可见性
+
+<DefList
+  items={[
+    { term: 'scope', sig: 'per-agent 注册可见性', desc: '用某个 agent 的 agent.ctx 注册，就把这份贡献限定在那个 agent 上。' },
+    { term: 'scope key', sig: '作用域标识', desc: '事件派发时用来过滤监听器的键。载荷里没有它的事件必须标 @dshScopeScan unsupported。' },
+    { term: 'shadowing', sig: '覆盖', desc: '某个 scope 上的贡献会覆盖同名的全局默认，例如 deployment:persona 提示段落。' },
+    { term: 'restriction', sig: '限制', desc: 'ctx.tools.restrict() 收窄某个 agent 可见的工具集。' },
+    { term: 'lineage', sig: '血缘', desc: 'fork 与委派会记录 parentSession 与 delegationDepth，形成可追溯的血缘。' },
+  ]}
+/>
+
+## 新行为应该放在哪里
+
+怎么写成插件、怎么挂进树、怎么进入一次 turn，见 [第 04 章](/docs/plugins)。下面这张表只回答「落在哪一个扩展点」。
+
+<DataTable
+  head={['目标', '机制']}
+  rows={[
+    ['加一个模型 provider', '在 ctx.llm 上注册它的适配器'],
+    ['加一个给模型用的能力', '在 ctx.tools 上注册；它的 schema 会加入提示装配'],
+    ['让某一个会话有不同的能力集合', '组合一个 agent preset；preset 里的服务行需要 isolate realm'],
+    ['加 shell 执行', '注册一个 ctx.shell 后端；本地那个通过 ctx.subprocess spawn'],
+    ['加持久终端执行', '注册一个 ctx.terminals 后端，加上 dsh-tool-terminal'],
+    ['加一个人类命令', '在 ctx.commands 上注册；它的分发不经过模型 turn'],
+    ['加后台工作', '在 ctx.jobs 上注册；job_* 工具负责收集或停止它'],
+    ['从外部 webhook 启动一个 Session', '在 ctx.webhookRuntime 上注册一条受信规则并挂一个 provider 适配器'],
+    ['加文件系统访问或策略', '注册一个 ctx.fs provider，或监听 fs/* 事件'],
+    ['约束 spawn 出来的进程', '用 ctx.sandbox 后端；消费者在 spawn 前包裹 argv'],
+    ['拦截请求 / 工具 / turn', '用对应的 agent/* 或 tools/* 事件；agent/turn-stopping 用来停一个 turn'],
+    ['加模型可见上下文', '调用 agent.inject()；它会落在下一次被接受的请求里'],
+    ['加 UI 或编辑器集成', '驱动 ctx.agents，并从 session/event 渲染'],
+    ['加一个 Web Client Chat 节点', '注册 ConversationNodeDefinition + 带 key 的 renderer'],
+    ['加持久会话状态', '扩展 SessionEventMap；从日志渲染与回放'],
+    ['生成会话标题', '注册唯一的 ctx.sessionTitle provider'],
+    ['管理同会话内的目标', '用 ctx.goals；通过 agent/* 续跑'],
+    ['fork 一个活会话', 'ctx.sessions.fork(source, boundary?, childSessionId?)'],
+    ['把注册限定到一个 agent', '用那个 agent 的 agent.ctx'],
+  ]}
+/>

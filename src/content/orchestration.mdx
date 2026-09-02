@@ -1,0 +1,452 @@
+## 四种编排，各自解决不同的问题
+
+<Callout variant="key">
+  这四者<strong>都不是 agent 循环的一部分</strong>。它们是可选能力，所以类型都住在自己的 seam 里，而不是 core。
+</Callout>
+
+<Cards
+  cols={2}
+  items={[
+    {
+      title: 'Subagent',
+      meta: 'ctx.subagents · 多实现共存',
+      tone: 'accent',
+      body: '一个 agent 把工作委派给子 agent。它是唯一按名字注册、允许多个实现同时共存的能力注册表——它效仿 LLM 适配器注册表，而不是单服务的 bash 执行器。',
+    },
+    {
+      title: 'Workflow',
+      meta: 'ctx.workflowEngine · 单实现',
+      tone: 'violet',
+      body: '让 agent 运行一段模型写的编排脚本，脚本再去启动子 agent。每个 context 只允许一个引擎实现；第二个引擎通过插件配置替换第一个，而不是并存。',
+    },
+    {
+      title: 'Job',
+      meta: 'ctx.jobs · 后台作业',
+      tone: 'lime',
+      body: '通用的长时任务运行时。后台命令、PTY 发送、subagent 都通过同一套 job_output / job_list / job_kill 控制。',
+    },
+    {
+      title: 'Goal',
+      meta: 'ctx.goals · 同会话目标',
+      tone: 'amber',
+      body: '事件溯源的目标域，对错完全以拥有它的会话日志为准。round 是包住 turn 的外层策略迭代。',
+    },
+  ]}
+/>
+
+## Subagent：两类能力，两种发现方式
+
+这是这一层最容易搞错的地方。
+
+<Split>
+  <Panel title="启动期能力：静态描述符 + 标志位" tone="accent">
+    provider 在一个静态描述符上标明它的**启动期**能力，服务在 one-shot 运行**存在之前**就检查。
+
+    ```ts
+    interface SubagentCapabilities {
+      readonly agentOptions: boolean
+      readonly outputSchema: boolean
+      readonly depthLimit: boolean
+      readonly toolFilter: boolean
+      readonly persona: boolean
+    }
+    ```
+
+    每个标志位与一个 `SubagentStartRequest` 选项**一一对应**（`depthLimit` 对应 `maxDepth`，其余同名）。
+  </Panel>
+  <Panel title="可续跑能力：方法存在即能力" tone="violet">
+    可续跑的子 agent 由**续跑管理器自己**组装，所以靠一个可选方法拦住——
+
+    `SubagentProvider.prepareContinuable`
+
+    **方法的存在本身就是能力**，发现机制是 TypeScript 的类型收窄。
+  </Panel>
+</Split>
+
+<Callout variant="warn" title="缺能力就直接拒绝，不能「接受后再假装没有」">
+  需要 provider 不具备的能力的请求会被 <code>SubagentError('UNSUPPORTED_CAPABILITY')</code>{' '}
+  拒绝。同样地，在没有 <code>prepareContinuable</code> 的 provider 上启动可续跑子 agent 也会被拒绝。
+</Callout>
+
+## 六个 provider
+
+<DataTable
+  head={['provider', '继承父对话上下文', '要点']}
+  rows={[
+    ['spawn-in-process', '否', '通过 parent.ctx 创建一个普通的 one-shot agent，把取消传进核心创建流程，通过 AgentHandle dispose'],
+    ['fork-in-process', '是', '唯一 inheritsParentContext: true 的实现；保留它自己的「裁剪到完成前缀」行为，因为工具时刻的委派通常在父 turn 仍打开时开始'],
+    ['acp', '否', '外部 ACP transport；在启动 transport 之前就拒绝 agentOptions'],
+    ['codex', '—', '外部 Codex CLI'],
+    ['claude-code', '—', '外部 Claude Code CLI'],
+    ['dsh-sdk', '—', '把四个 Agent 路由字段合并到实例默认值之上，并在子运行时初始化时校验'],
+  ]}
+/>
+
+<Callout variant="rule" title="inheritsParentContext 只描述对话种子">
+  它<strong>不</strong>暗示继承了工具、服务或权限。这个字段存在，是为了让消费者能写出准确的、给模型看的说法。
+  每个子 agent 拿到的是<strong>一个新的扁平作用域</strong>，而不是继承父注册。
+</Callout>
+
+## 三个组合控制项：可见性不等于权限
+
+<DefList
+  items={[
+    {
+      term: 'toolFilter',
+      sig: 'ToolRestriction',
+      desc: '进程内后端在子 agent 的创建窗口里，把它当成挂在这个 scope 上的 tools.restrict()：被点名的工具从子 agent 的提示里消失，执行也会拒绝——这是「一种可见性」。未知名字会在校验时直接报错。',
+    },
+    {
+      term: 'persona',
+      sig: 'string',
+      desc: '进程内后端把它注册为子 agent 上、挂在这个 scope 的 deployment:persona 段落，只覆盖这个子 agent 的部署人格。模板语义与部署人格相同：对已注册变量做严格的 {{…}} 插值。',
+    },
+    {
+      term: 'maxDepth',
+      sig: 'number',
+      desc: '为正在启动的子 agent 设的绝对委派深度上限：它算出来的深度必须小于或等于这个非负安全整数。tool-subagent 的部署默认是 3；0 禁止委派；provider-managed 表示不向 provider 发送 cap。没有 depthLimit 能力的进程外 provider 在挂载时会因带数字 maxDepth 而 fail loud。',
+    },
+  ]}
+/>
+
+## Activation：可续跑子 agent 的核心概念
+
+一个**可续跑的后台 subagent** 是**一个持久的子 Session**，加上**至多一个进程本地的 Activation**——也就是重建出来的子 Agent 还活着的那段时间。
+
+<Callout variant="trap" title="Activation 不是请求、结果、取消，也不是 Task">
+  它可以执行<strong>很多个 FIFO turn</strong>，并且在它创建的后代仍在运行时自己也继续活着。
+  <strong>没有任何可续跑路径会创建 Task 或中间的结果包装器。</strong>
+</Callout>
+
+```text
+persisted Session
+  -> optional live Activation
+       -> one retained AgentHandle
+       -> Agent inbox as the only turn FIFO
+       -> zero or more owned child Activations
+```
+
+<Figure
+  kind="状态图"
+  title="Activation 的三种内部状态"
+  caption={
+    <>
+      管理器从 <strong>Agent 的静止性</strong>与<strong>自有子集合</strong>推导这些内部条件，
+      而<strong>不维护第二套执行状态机</strong>。
+    </>
+  }
+>
+  <Matrix
+    corner="状态"
+    cols={['含义', 'sendMessage 的路由']}
+    rows={[
+      {
+        label: 'running',
+        cells: [
+          { label: 'Agent 正在接受输入或跑 turn，或 inbox 里有会唤醒的工作', tone: 'lime' },
+          { label: '在同一个 Activation 里 steer 最近的 step', tone: 'lime' },
+        ],
+      },
+      {
+        label: 'waiting',
+        cells: [
+          { label: '静止了，但仍拥有至少一个尚未完成 dispose 的子 Activation', tone: 'amber' },
+          { label: '唤醒并 steer 同一个 Activation', tone: 'amber' },
+        ],
+      },
+      {
+        label: 'settled',
+        cells: [
+          { label: '静止且每个自有子都已 dispose——此时管理器 dispose AgentHandle 并移除 Activation', tone: 'violet' },
+          { label: '冷恢复一个新 Activation，然后 steer 它', tone: 'violet' },
+        ],
+      },
+    ]}
+  />
+</Figure>
+
+## sendMessage：唯一的模型撰写消息操作
+
+<Callout variant="key" title="Agent inbox 是唯一的队列">
+  每一条 Agent 间消息都用 <code>Agent.steer()</code>：空闲目标会开一个 turn，运行中的目标在最近的 step 边界 claim 它。
+  <strong>续跑层没有定义任何 subagent 专属的投递路由。</strong>
+</Callout>
+
+权限来自**确切的活发送方**：
+
+<Pipeline
+  stages={[
+    {
+      title: '父到子投递',
+      tone: 'accent',
+      body: (
+        <>
+          要求目标的 <code>SessionHeader.parentSession</code> 点名发送方。
+        </>
+      ),
+    },
+    {
+      title: '子到父投递',
+      tone: 'violet',
+      body: '要求发送方活着的 Activation 点名目标。',
+    },
+    {
+      title: '一律拒绝',
+      tone: 'rose',
+      body: '兄弟、超过一条边的祖先、自指目标、过期的 Agent 对象，以及 one-shot 子 agent。',
+    },
+  ]}
+/>
+
+每条被接受的消息被框成 `Agent <sender-id> sent a message:` 并记录 `AgentMessageSource`（`kind: 'agent-message'`，`form: 'relay'`）。
+
+<Callout variant="warn" title="来源记录发送方，但不授予权限">
+  provenance 只是记录。同样地，对 <code>startContinuable()</code> 与 <code>sendMessage()</code>，
+  <strong>调用方 signal 只负责查找、把目标拉起来、以及把消息送进 inbox 被接受之前的这一段</strong>；
+  之后管理器独立拥有这个 Activation——后来的调用方取消<strong>既不会</strong>取消已接受的 turn，
+  <strong>也不会</strong> dispose 这个子 agent。
+</Callout>
+
+## interrupt：唯一的公开停止手段
+
+`SubagentRuntime.interrupt(targetSessionId, authority)` **同步授权**，对活目标发出 `Agent.cancel(cause, { keepInbox: true })`，然后**不等待静止就返回**。
+
+<DataTable
+  head={['被 interrupt 影响', '不受影响']}
+  rows={[
+    ['当前 turn 被取消', 'Activation 本身'],
+    ['已 claim 进被中断 turn 的工作不会被重新排队', '未被 claim 的挂起 inbox 工作'],
+    ['—', '已发布的后代'],
+  ]}
+/>
+
+一旦被中断的驱动空闲下来，一次唤醒性的 send 就会**恢复那条被停放的 FIFO 队列**。
+
+```ts
+/**
+ * Authority under which one interrupt request is admitted.
+ */
+type SubagentInterruptAuthority =
+  | { readonly kind: 'user'; readonly parentSessionId: SessionId }
+  | { readonly kind: 'ancestor'; readonly agent: Agent }
+```
+
+<Callout variant="note" title="不存在的目标是被接受的 no-op">
+  未知、one-shot、或已 settled 的目标，以及一个没有管理器的组合，都是<strong>被接受的空操作</strong>。
+  但对一个活目标，父地址不匹配或调用方在它的活祖先链之外会以 <code>UNAUTHORIZED</code> 拒绝。
+</Callout>
+
+## 持久枚举：不加载任何 Agent
+
+`listChildren(parentSessionId)` 从 `ctx.sessions.list()` 与可选的 `ctx.sessionPersistence.list()` 的**活优先合并**中枚举直接子 agent——身份以会话为准——**不用查询服务，也不加载或恢复任何 Agent**。
+
+<Callout variant="trap" title="origin: 'subagent' 标记不能建立身份">
+  这个标记只用于<strong>分类枚举</strong>与粗粒度的通用路由拒绝。它<strong>不能</strong>建立有效的描述符、可恢复性或授权——
+  身份归 projection 折叠所有，恢复归 Activation 契约所有。
+</Callout>
+
+每行的 `mode` / `label` 走一个**三级阶梯**：活子 agent 用 `stateOf()`（零次日志读取）；冷的用可选的 projection 检查点缓存（`cachedSnapshot`——自有描述符一旦追加就不可变，所以通过自有后缀 seq 核对过的身份已经是终态）；否则读一次 `persistence.inspect()` 并通过注册表折叠。
+
+## one-shot 运行：SubagentRun 与它的结果
+
+<Callout variant="key">
+  <code>SubagentRun</code> 是<strong>消费者拥有</strong>的句柄：一次可 dispose 的前台委派，一个结果——
+  <strong>它从来不是一个持久的子 agent 句柄</strong>。可续跑对话<strong>根本没有 run</strong>，
+  因为续跑管理器直接持有它们的 <code>AgentHandle</code>，并通过子 agent 自己的 inbox 给每个 turn 排序。
+</Callout>
+
+<DefList
+  items={[
+    {
+      term: 'result',
+      sig: 'Promise<SubagentResult>',
+      desc: '子 agent 失败会以一个非 completed 的 stopReason 解析；只有无法表示的基础设施故障才 reject。消费者 await 结果，并在所有路径上 dispose 这个 run 以达到静止。',
+    },
+    {
+      term: 'structured',
+      sig: '仅在 outputSchema 被成功满足后存在',
+      desc: '请求一个 schema 并不保证得到它；子 agent 失败或在没有有效捕获的情况下结束时，provider 可以返回 stopReason: "error"。',
+    },
+    {
+      term: 'diagnostic',
+      sig: '≤ 4096 UTF-8 字节',
+      desc: 'provider 可以给一个非 completed 结果附上安全的、非助手内容的诊断。provider 先移除工具输入、文件内容、环境值、凭据与原始协议载荷，消费者再把它与 output 分开呈现。',
+    },
+    {
+      term: 'stopReason ≠ completed',
+      sig: 'output 可能是部分的',
+      desc: '消费者把它映射成一个 isError 工具结果，而不是把部分输出报告为成功。',
+    },
+  ]}
+/>
+
+## Workflow：模型写的脚本
+
+<Callout variant="rule" title="meta 与 args 是纯 JSON 数据">
+  引擎在<strong>任何东西运行之前</strong>就用它的 schema 校验 <code>meta</code> 并直接拒绝——
+  <strong>不会为了拿到 meta 而先求值任何脚本文本</strong>。
+</Callout>
+
+`parent` 是**必需**的：脚本启动的每一个子 agent 都归属于它，cwd、血缘与深度都通过 subagent seam 传递。`phases` 只是**进度用词**：`phase()` 调用为观察者匹配标题，不暗示任何执行结构。
+
+<Figure
+  kind="决策树"
+  title="脚本内失败的两种命运"
+  caption={
+    <>
+      <code>parallel()</code> / <code>pipeline()</code> 组合器会<strong>重新抛出</strong> fatal 错误，而不是把该项映射成{' '}
+      <code>null</code>：一个拼错的选项<strong>必须直接让脚本失败</strong>，不能化成读起来像普通子 agent 失败的东西。
+    </>
+  }
+>
+  <Fanout
+    source={{ title: '脚本执行中的失败', kind: 'gate', tone: 'amber' }}
+    targets={[
+      {
+        label: 'WorkflowError.fatal = true',
+        title: '直接让脚本失败',
+        sub: '坏参数 · 未知/延迟的 agent() 选项 · 越界 schema · 触顶的 cap · seam 启动失败 · 取消',
+        tone: 'rose',
+      },
+      {
+        label: '每项 null',
+        title: '保留给子运行失败',
+        sub: '非 completed 的 stopReason，以及普通的阶段内脚本错误',
+        tone: 'lime',
+      },
+    ]}
+  />
+</Figure>
+
+`WorkflowRun` 的纪律很硬：
+
+<Steps
+  items={[
+    {
+      title: 'result 不会 reject',
+      body: (
+        <>
+          脚本失败以 <code>stopReason: 'error'</code> 解析。<code>stopReason</code> 是一个<strong>封闭</strong>联合（引擎拥有，消费者可以穷尽）：
+          <code>completed</code> | <code>cancelled</code> | <code>error</code>。
+        </>
+      ),
+    },
+    {
+      title: '一旦被取消，就在引擎的有界宽限期内 settle',
+      body: (
+        <>
+          即使脚本自己一直不 settle——引擎会<strong>强制 settle 为 cancelled</strong>，worker-thread 引擎随后终止脚本的 worker。
+          所以一个 await <code>result</code> 的消费者<strong>不会卡在取消之后</strong>。
+        </>
+      ),
+    },
+    {
+      title: 'dispose() = cancel + 那个有界 settle + 子 agent 静止',
+      body: '它不会卡死在一个卡住的脚本上。消费者必须在所有路径上 dispose。',
+    },
+  ]}
+/>
+
+<Callout variant="note" title="workflow/* 事件是只观察的数据快照">
+  每个载荷都以 <code>WorkflowRunInfo</code>（id + meta）开头，<strong>从不</strong>是活的{' '}
+  <code>WorkflowRun</code>，所以订阅者拿不到 <code>cancel</code> / <code>dispose</code>；
+  <code>workflow/end</code> 故意不带结果值，这样观察结果的监听器拿不到调用方结果的可变别名。
+  每个 emit 都是逐监听器隔离的，每个监听器收到自己的载荷克隆。
+</Callout>
+
+## Ralph：一条建立在两个能力之上的专门策略
+
+<Callout variant="warn" title="agent 循环里没有 Ralph 模式">
+  <code>ralph</code> 是一个<strong>固定的前台 workflow</strong>：把一个不可变的目标交给一串<strong>全新的</strong>子 agent，
+  每个都以<strong>没有对话种子</strong>开始，只携带上一份有界的报告。同会话的 goal 域保持独立。
+</Callout>
+
+调用在 worker 报告完成、报告一个具体阻塞点，或到达轮次上限时返回。部署默认 <code>maxRounds</code> 是 <strong>256</strong>；模型可以传一个更低的值，不能抬高。终止状态是封闭的：<code>complete</code> / <code>blocked</code> / <code>budget-limited</code> / <code>round-failed</code>。
+
+<Callout variant="trap" title="完成与阻塞是 worker 的报告，不是独立认证">
+  只在<strong>直接的人类明确要求</strong> Ralph 循环或全新 agent 的迭代执行时才用它。
+  普通的长期目标属于 goal 工具；有界的委派属于 subagent 或 workflow。
+</Callout>
+
+## Job：与种类无关的后台运行时
+
+<DefList
+  items={[
+    { term: 'JobId', sig: '<kind>-N', desc: '带品牌的 id。访问控制依赖 owner 授权，不依赖 id 保密。' },
+    {
+      term: 'JobKind',
+      sig: '可合并扩展的 map',
+      desc: '注册表把 kind 当作不透明的 id 命名空间。',
+    },
+    {
+      term: 'JobStart',
+      sig: '生产者契约',
+      desc: '声明身份与一个启动器。运行时在调用 run() 之前完成预检，并在没有后续可失败步骤的情况下提交。生产者拥有执行资源，运行时拥有身份、访问与生命周期状态。',
+    },
+    {
+      term: 'maxConcurrentJobsPerOwner',
+      sig: '默认 10',
+      desc: '本地 provider 按确切 owner 统计 running 加 stopping 记录，无主 job 共享一个桶。生产者到达终态时释放容量。',
+    },
+    {
+      term: 'reported',
+      sig: '抑制重复通知',
+      desc: '另一个报告者已经投递或承诺投递终态之后，就不再发完成通知；owner 或服务 teardown 取消、把工作处理完的那次也包括在内。',
+    },
+  ]}
+/>
+
+`job_output`、`job_list`、`job_kill` 三个工具与种类无关：agent 启动的任何 job——后台命令、PTY 发送，或 one-shot background subagent——都通过同一套控制来读、列与取消。
+
+<Callout variant="trap" title="可续跑 subagent 不注册 Job">
+  只有 one-shot 后台委派才向 <code>ctx.jobs</code> 登记 <code>kind: 'subagent'</code>。
+  可续跑路径没有 <code>SubagentRun</code>，也<strong>不</strong>创建 Task——续跑管理器直接持有 <code>AgentHandle</code>，跟进走 <code>send_message</code> / <code>interrupt_agent</code>。
+</Callout>
+
+<Callout variant="key" title="完成会在会话内被告知">
+  一个忙碌的 agent 在它的<strong>下一个 step</strong> 收到通知；一个空闲的 agent 会被一次{' '}
+  <strong>follow-up turn 唤醒</strong>，并按 owner 设上限。
+</Callout>
+
+## Goal：round 是外层策略迭代
+
+<Callout variant="rule" title="turn / step / round 三个词不能混用">
+  <strong>step</strong> 是一次模型请求加上它引发的工具调用；<strong>turn</strong> 是零个或多个 step；
+  <strong>round</strong> 是<strong>包住 turn 的外层策略迭代</strong>，由续跑消费者拥有。
+</Callout>
+
+```ts
+/** Durable continuation phase. Activation is process-local and separate. */
+type GoalPhase = 'active' | 'paused' | /* … */
+```
+
+<DefList
+  items={[
+    {
+      term: 'GoalRef',
+      sig: 'compare-and-set 身份',
+      desc: '调用方通过它变更一个确切的 revision；每一次被接受的持久变更都让 revision 递增。',
+    },
+    {
+      term: 'goal/change',
+      sig: '持久会话事件',
+      desc: '每一次变更的载荷要么是一份完整的变更后快照，要么是一个 clear 墓碑。严格折叠与持久 projection 只从这些事件算出生命周期状态——inbox 变更不影响 goal 状态。',
+    },
+    {
+      term: 'GoalMessageSource',
+      sig: '{ kind: "goal", goalId, round }',
+      desc: '续跑消费者给每个被接受的 user-message turn 标上一个正的、连续的 round 号与当前 revision。只有这些被接受的 user/message 事件才推进 roundsStarted。',
+    },
+    {
+      term: 'activation',
+      sig: 'GoalActivation · 从不持久化',
+      desc: '进程本地的续跑资格。持久阶段回答「目标怎么了」，activation 分开回答「续跑消费者能不能再开一轮」。',
+    },
+  ]}
+/>
+
+<Callout variant="warn" title="回放会拒绝这些情况">
+  非正的 round、round 空洞、过期 revision、已停止的阶段，以及 cap 溢出。
+  <code>GoalService</code> 强制<strong>确切活 agent 身份</strong>与 compare-and-set 变更，
+  并且它的<strong>第一次依赖访问</strong>就会在 projection 注册表或 key 缺失时失败。
+</Callout>

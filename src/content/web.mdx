@@ -1,0 +1,453 @@
+## 浏览器里的另一棵 Cordis 树
+
+<Callout variant="key">
+  Web Client <strong>本身就是一个浏览器侧的 Cordis 应用</strong>，由独立加载的插件装配而成。
+  它不是「一个前端」，而是同一套插件哲学的第二次实例化。
+</Callout>
+
+它的架构有四块可复用的基础：**Client Modules** 加载插件图，**API Gateway** 提供类型化的 Host 通信，**Slots** 组合 React UI，**Conversation** 把一段会话历史窗口变成由目标拥有的视图。
+
+<Callout variant="warn" title="产品 GUI 不用 Tailwind">
+  <code>dsh web</code> 的样式是 CSS Modules、<code>clsx</code> 与 <code>--dsw-*</code> token，由{' '}
+  <code>packages/client/ui-theme</code> 拥有。组件库与 Tailwind 在那棵 Client 树里是禁止的。本站（
+  <code>learn/</code>）用 Next.js + Tailwind 讲架构，不等于产品 GUI 的技术选型。
+</Callout>
+
+## 六层与它们的所有权
+
+<Figure
+  kind="架构图"
+  title="Host 状态 → Remote 传输 → Client model → UI 适配器 → Conversation → Slots → React"
+  caption={
+    <>
+      依赖方向是<strong>单向</strong>的。用户动作沿回调往回走，回调闭包捕获一个被注入的 Client 服务或生成的 Remote 命名空间。
+      <strong>展示组件收不到 Cordis 的 ctx、传输对象，或另一个特性插件的实现。</strong>
+    </>
+  }
+>
+  <Layers
+    rows={[
+      {
+        title: 'Host 应用',
+        meta: 'packages/api/*-controller',
+        tone: 'accent',
+        chips: [{ title: '业务服务' }, { title: 'Host 入口' }],
+        note: '拥有真正生效的状态、持久化、变更排序、访问策略，以及流从哪里产生。',
+      },
+      {
+        title: '传输与 API 装配',
+        meta: 'client/connection · api/gateway · api/remotes',
+        tone: 'violet',
+        chips: [{ title: 'Client generation' }, { title: 'ctx.remote' }, { title: '事件转发' }],
+        note: '建立一个 Client generation，暴露生成的 ctx.remote 方法与流，转发选定的 Cordis 事件，承载取消与结果。',
+      },
+      {
+        title: 'Client models',
+        meta: 'session-controller/client · workspace-controller/client',
+        tone: 'lime',
+        chips: [{ title: '无 React 的镜像' }, { title: '身份稳定' }, { title: '窄命令服务' }],
+        note: '维护 Host 状态的无 React 镜像，解决 stream/unary 竞态，拥有对象身份与订阅。',
+      },
+      {
+        title: 'UI 适配器',
+        meta: 'client/ui-session · client/ui-workspace',
+        tone: 'amber',
+        chips: [{ title: '标准 Slot 源' }],
+        note: '把 model 的 observable 转成 root 或 Session 作用域的标准 Slot 源，且不接管业务状态的所有权。',
+      },
+      {
+        title: 'Conversation 数据',
+        meta: 'ui-conversation · ui-chat · ui-trajectory',
+        tone: 'rose',
+        chips: [{ title: 'Definition' }, { title: '目标快照' }, { title: '共享外壳与输入流' }],
+        note: '把标准事件与被压缩的历史 Assistant 运行装配成互相独立的目标快照。',
+      },
+      {
+        title: '组合与渲染',
+        meta: 'ui-slots · ui-renderer · ui-layout',
+        tone: 'accent',
+        chips: [{ title: '扩展位置声明' }, { title: '算出 props' }, { title: 'observable → hook' }],
+        note: '声明扩展位置、算出组件 props、把 observable 绑到 React hook，并挂载最终的树。',
+      },
+    ]}
+  />
+</Figure>
+
+## 浏览器启动
+
+<Pipeline
+  stages={[
+    {
+      title: 'Host 写入 window.__DSH_BOOT__ 并安装模块加载器 facade',
+      sub: 'WebBootGraph',
+      tone: 'accent',
+      body: '这一步发生在被解析器预加载的脚本执行之前。',
+    },
+    {
+      title: '模块系统是一张惰性 CommonJS 表',
+      tone: 'violet',
+      body: '加载一个 bundle 只是注册它的 factory；真正跑起一个 entry 时，才会带着对平台模块与已声明动态依赖的同步 require 去执行那个 factory。',
+    },
+    {
+      title: 'Web 启动内核创建模块系统并预取 immediately 条目',
+      sub: 'stage-one prefetch',
+      tone: 'lime',
+      body: '随后挂载 vendored 的 Cordis Loader，并创建每一个图条目。',
+    },
+    {
+      title: 'ui-renderer 水合无框架的启动 DOM',
+      sub: "renderSlot('root')",
+      tone: 'amber',
+      body: '在完整名册达到稳定状态之后，调用唯一那次 context 级的 renderSlot 操作。',
+    },
+  ]}
+/>
+
+<Callout variant="rule" title="Cordis 服务注入决定激活，模块图顺序只决定同步 import 能不能真正跑起来">
+  两者是不同的东西。<code>WebBootGraph.entries</code> 是<strong>模块图顺序</strong>——一个动态包行排在请求它的{' '}
+  <code>external</code> 行之前；<strong>Cordis 激活顺序与之无关</strong>，仍然归 fiber 的服务等待所有。
+</Callout>
+
+<Callout variant="warn" title="没有有效 manifest 的页面无法启动">
+  <code>global</code> 行渲染成 <code>globalThis["__DSH_BOOT__"]</code>，其中 <code>&lt;</code>{' '}
+  被转义，好让插件控制的字符串无法从 script 元素里逃出去。浏览器解析器会拒绝格式错误的行或批次、未知成员，以及没有恰好一个初始 combo 描述符的条目。
+</Callout>
+
+## Typert：让每一次远程调用在编译期被检查
+
+<Callout variant="key" title="InvocationDescriptor 是本地反射，不是线上消息">
+  Host 与消费者构建各自生成对应的描述符；<strong>请求只发送 endpoint 与命名的 args</strong>。
+</Callout>
+
+<DefList
+  items={[
+    {
+      term: 'TypertLookupMap',
+      sig: '可合并扩展的空 map',
+      desc: '业务对象包通过声明合并扩展它，把一个 Host 对象类型关联到它的线上身份。生成的描述符点名这些 key，运行时 provider 提供活的解析行为。',
+    },
+    {
+      term: 'TypertContextMap',
+      sig: '可合并扩展的空 map',
+      desc: '把一种按 scope 划分的 Context 种类关联到它的线上身份。',
+    },
+    {
+      term: "codec: 'strict'",
+      sig: 'typeSymbol + schema',
+      desc: '严格 codec 携带生成的 schema。',
+    },
+    {
+      term: "codec: 'src-json'",
+      sig: '仅强制 JSON 安全',
+      desc: 'SRC codec 只强制值是 JSON 安全的，不做结构化类型恢复。',
+    },
+    {
+      term: "mode: 'stream'",
+      sig: 'unary 调用时缺省',
+      desc: '流式调用会校验并投递每一个 yield 出来的项。',
+    },
+    {
+      term: 'acceptsUndefined',
+      sig: 'true | 缺省',
+      desc: '缺失的线上字段只有在显式声明为 T | undefined 时才解码成 undefined。',
+    },
+  ]}
+/>
+
+<Callout variant="trap" title="取消是带外的载体 signal">
+  它在业务参数<strong>之后</strong>注入，<strong>不进 args</strong>。
+</Callout>
+
+注册表在一个 lookup 的 resolver 卸载后**保留它的线上声明**。所以 SRC 发现仍然把那个参数分类为 lookup 并**失败为 unavailable**，而不是把线上值当成一个普通业务对象接受。
+
+## 传输的三层职责划分
+
+<DataTable
+  head={['拥有者', '职责']}
+  rows={[
+    ['Connection', '请求关联、/api 载体、信任检查、确切的 Fetch 路由、连接 generation'],
+    ['API Gateway', 'Remote 派发、取消、逻辑流、选定 Host 事件的转发'],
+    ['生成的 Remote 方法 / 显式 Remote 流', 'controller 操作归它们；特性自有的下载注册确切的 Fetch 路由'],
+  ]}
+/>
+
+内部的 `$events` 逻辑流是**连接 generation 的来源**。它开场的 `ready` 帧携带用于路径显示的 Host home，并在 **Host 监听器已挂上之后、任何 controller 开始基线读取之前**建立 generation。
+
+`ctx.remote.$on()` 把允许名单里的普通事件投递到 root Client Context，把按 scope 划分的 waterfall 事件投递到解析出的 Session Context；一个 waterfall 监听器要么返回结果，要么调 `next()`，要么 reject。
+
+## Session 的 Client 侧模型
+
+组织形式是 `ClientSessions → SessionManager → Session`：
+
+<Cards
+  cols={3}
+  items={[
+    {
+      title: 'ClientSessions',
+      meta: 'ctx.sessions',
+      tone: 'accent',
+      body: '拥有 Session 的 scope 与稳定的 SessionBinding 对象，并算出当前选中的列表状态。',
+    },
+    {
+      title: 'SessionManager',
+      meta: '基线与冲突排序',
+      tone: 'violet',
+      body: '拥有列表基线、活的列表/控制更新、惰性 Session 实例、队列、projection 存储、subagent 目录，以及 pull 与后续更新之间的冲突排序。',
+    },
+    {
+      title: 'Session',
+      meta: '一个连续的逻辑事件窗口',
+      tone: 'lime',
+      body: '由 SessionEventLikeEntry 值表示，拥有分页、follow、prompt/control 状态，以及被适配器消费的那个 observable 快照。',
+    },
+  ]}
+/>
+
+<Figure
+  kind="数据流"
+  scroll
+  title="持久事件路径"
+  caption={
+    <>
+      <code>follow()</code> 的<strong>第一帧</strong>包含当前 header、尾页、游标与完整的 projection 基线。
+      <strong>每一个物理 generation 都从那份快照原子性地替换掉被保留的窗口</strong>，之后标准活事件按 seq 追加。
+      <code>page()</code> 保留给更老的历史与空洞修复。
+    </>
+  }
+>
+  <Flow
+    nodes={[
+      { title: 'Host 会话日志', kind: 'store', tone: 'accent' },
+      { title: '打包过的 Remote follow / page', sub: '历史记录', kind: 'io', tone: 'violet', edge: '流' },
+      { title: 'Client SessionEventLikeEntry 窗口', kind: 'store', tone: 'lime', edge: '按逻辑 seq 校验' },
+      { title: 'Conversation Contexts', sub: '(kind, id)', kind: 'service', tone: 'amber', edge: '装配' },
+      { title: '目标快照', sub: 'chat / trajectory / …', kind: 'plain', tone: 'rose', edge: '增量 builder' },
+      { title: 'Slot 视图 → React', kind: 'plain', tone: 'neutral', edge: '渲染' },
+    ]}
+  />
+</Figure>
+
+<Callout variant="note" title="Client model 不是第二个业务真相来源">
+  Host controller 决定持久状态与变更结果；<strong>Client model 只维护最新可用的本地视图</strong>，
+  在有利于渲染时保留对象身份，并编码「延迟响应与替换基线如何合并」。
+</Callout>
+
+## Conversation：五个概念
+
+<DataTable
+  head={['概念', '拥有者与用途']}
+  rows={[
+    [
+      'Event Definition',
+      '业务包一次匹配一个标准事件或一段被打包的 Assistant 运行，按稳定的 (kind, id) 关联它，折叠确定性的 State，并可选地创建目标节点。',
+    ],
+    [
+      'Context',
+      '引擎拥有的、针对一个 (kind, id) 的有序 Matches 与当前 State。一段被打包的运行占用一个 update Match；只有 update 的证据可能保持 pending，直到分页提供它唯一的标量 start。',
+    ],
+    ['Location', '引擎拥有的 Session / Turn / Step 坐标，从持久边界事件算出来。Definition 可以把类型化数据发布到某个 Turn 或 Step 上。'],
+    ['View Definition', '目标包为每个 Session 创建一个增量 builder，并拥有该目标的最终快照类型。'],
+    ['View', '一个 Slot 条目（如 Chat 或 Trajectory）只读它自己的目标快照，并渲染目标自有的节点。'],
+  ]}
+/>
+
+<Callout variant="key" title="Chat 与 Trajectory 可以识别同一个持久事件族">
+  但<strong>各自保留自己的 Definition State 与最终节点载荷</strong>，且<strong>互不 import、互不共享</strong>对方的最终展示模型。
+  共享的目标中立机制仅限于：身份路由、有序回放、Location 数据、前驱依赖与发布节奏。
+</Callout>
+
+## 目标激活是单调的
+
+<Steps
+  items={[
+    {
+      title: '创建或读取一个目标源不会激活它',
+      body: '每个 Session 维护一个单调的活跃目标集合。',
+    },
+    {
+      title: '外壳显式激活它持久化的或新选中的 View',
+      body: '另一个消费者则通过它的第一次源订阅来激活一个目标。',
+    },
+    {
+      title: '首次激活创建该目标的 builder，并从当前按目标索引的 Contexts 调一次 replace()',
+      body: (
+        <>
+          之后的每次 flush 对每个活跃目标调 <code>apply()</code>，而<strong>取消订阅不会移除任何一个目标</strong>。
+        </>
+      ),
+    },
+    {
+      title: '外壳拥有 View 选择',
+      body: (
+        <>
+          在一个 binding 被创建或被选为当前时、以及 View 名册变化之后，外壳解析出注册的首选 View 或回退到 Chat。
+          <strong>装配器只收到解析后的目标 id</strong>，它自己不选择 Chat 或任何默认目标。
+        </>
+      ),
+    },
+  ]}
+/>
+
+## 写一个可回放的事件族
+
+<Callout variant="rule" title="先定一个稳定的业务 id，再写 Definition">
+  每一个贡献到同一个 Node 的事件都必须携带那个 id，或从它自己的载荷独立算出来。
+  <strong>客户端不能把一个 update 分给「最近那个未完成的」Context。</strong>
+</Callout>
+
+<DataTable
+  head={['事件', '角色', '必需的持久事实']}
+  rows={[
+    ['review/start', '唯一的 start', 'reviewId · Turn/Step 坐标 · title'],
+    ['review/progress', 'update', '同一个 reviewId · 坐标 · 可回放的进度'],
+    ['review/end', 'update', '同一个 reviewId · 坐标 · 最终摘要'],
+  ]}
+/>
+
+每个 `(kind, id)` **最多有一个 start 事件**。单事件的业务可以用事件自身的稳定身份（如 `event.seq`）作为它 Definition 本地的 id。
+
+<Callout variant="trap" title="增量事件被支持，但要优先整值检查点">
+  因为当 start 落在已加载窗口<strong>之外</strong>时，整值检查点仍然有用。
+  每个 delta 必须携带稳定 id，并在按日志 <code>seq</code> 升序回放时产生<strong>确定性</strong>的 State——
+  <strong>它不得依赖只在活运行期存在的内存</strong>。
+</Callout>
+
+如果当前历史窗口里只有 update，装配器会保留一个 pending Context 且**不构建 State**，直到更老的一页提供 start。如果产品必须在 start 加载之前就渲染，那么一个终态或检查点事件必须携带足够的整体回退状态——**不要靠扫描不相关的事件去恢复它**。
+
+历史上连续的同块 `assistant/chunk` delta 会以 `chunkrow/text-chunks`、`chunkrow/reasoning-chunks` 或 `chunkrow/tool-call-chunks` 到达。它们的顶层 `seq` 与 `time` 标识第一个逻辑成员。这些**仅客户端**事件只能是 update；`start()` 收到的一定是标准 `SessionEvent`。
+
+## Slots：两个独立的轴
+
+<Figure
+  kind="对照表"
+  title="cardinality 与 scope"
+  caption={
+    <>
+      <code>priority</code> 对 <code>single</code>、<code>list</code>、<code>keyed</code>{' '}
+      是覆盖等级，对 <code>chain</code> 是选举顺序；<strong>值越小越先运行或渲染</strong>。
+      普通的增量贡献应当选一个新的 list <code>id</code> 或 keyed <code>key</code>；<strong>故意复用一个随产品发布的 cell 会替换它的展示</strong>。
+    </>
+  }
+>
+  <Matrix
+    corner="轴"
+    cols={['取值', '含义']}
+    rows={[
+      {
+        label: 'cardinality',
+        cells: [
+          { label: 'single', tone: 'accent' },
+          { label: '一个格子，激活的优先级胜出者渲染。要做增量列表就该用子 slot，而不是把它当加法列表用', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'cardinality',
+        cells: [
+          { label: 'list', tone: 'violet' },
+          { label: '格子按必需的 id 寻址，按 order 再按注册顺序排列', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'cardinality',
+        cells: [
+          { label: 'keyed', tone: 'lime' },
+          { label: 'owner 派发一个 entryKey，匹配的格子带上任何 key 专属 props 渲染', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'cardinality',
+        cells: [
+          { label: 'chain', tone: 'amber' },
+          { label: '每个条目提供一个纯 select(owner)；优先级顺序里第一个非 null 结果渲染并作为 matched 收到它，否则渲染 owner 回退', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'scope',
+        cells: [
+          { label: 'root', tone: 'accent' },
+          { label: '一个 root 作用域的组件与 store 实例', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'scope',
+        cells: [
+          { label: 'session-maybe', tone: 'violet' },
+          { label: '跟随当前选择，但在没有 Session 时仍可渲染；Session 值是可选的', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'scope',
+        cells: [
+          { label: 'session', tone: 'lime' },
+          { label: '要求一个已解析的 Session binding，并收到确定的 Session 值', tone: 'neutral' },
+        ],
+      },
+    ]}
+  />
+</Figure>
+
+## 组件收到什么，以及收不到什么
+
+<Callout variant="warn" title="组件收不到 ctx">
+  父拥有的时点值通过 <code>renderSlot</code> 的 owner 参数进入；共享视图状态用一个声明的 store；
+  <strong>服务与 model 对象留在 apply 闭包里</strong>，再通过回调或 observable 源交给组件。
+</Callout>
+
+<DataTable
+  head={['输入', '由什么声明', '组件类型']}
+  rows={[
+    ['owner 值与标准作用域值', 'SlotMap 行 + 已安装的作用域适配器', 'PropsRuntime<K>'],
+    ['被授权的子渲染器', "注册的 children key", 'PropsRenderSlots<S>'],
+    ['共享视图状态的 selector hook 与变更回调', '注册的 store', 'PropsStore<H>'],
+    ['私有数据、回调与 observable hook', "注册的 inject 工厂", 'InjectFace<I>'],
+    ['本地化的 t 函数', '注册的 locale 命名空间', 'PropsLocale<N>'],
+    ['被选中的 chain 值', 'select 的结果', "ComposedProps 里的 matched"],
+  ]}
+/>
+
+<Callout variant="key" title="选择哪种输入的判据">
+  已在某次渲染时点已知的值用 <strong>owner props</strong>；某一个条目的回调与私有 observable 用<strong>注册 inject</strong>；
+  由 slot owner 控制的能力用 <strong>slot 级 inject</strong>；跨条目共享或跨重挂载保留的可变视图状态用<strong>声明的 store</strong>。
+  <strong>React 节点通过子 slot 组合，而不是通过被注入的值。</strong>
+</Callout>
+
+`inject` 返回值里有一个保留的 `hooks` 对象，接受裸的 `getSnapshot` / `subscribe` 源。渲染器把 `hooks: { status }` 转成组件 prop `useStatus(selector)`，并按源身份缓存这个绑定——**组件拿不到源本身，也不直接调 `useSyncExternalStore`**。
+
+## 扩展规则
+
+<Steps
+  items={[
+    {
+      title: '只为声明而 import 另一个特性包，且必须用 import type',
+      body: '不要 import 或再导出它的运行时值。',
+    },
+    {
+      title: '只在拥有并渲染那个位置的组件里声明新的子 slot',
+      body: (
+        <>
+          其他包用 <code>ctx.slots.inject()</code> 等待，并通过 <code>ctx.slots.register()</code> 贡献。
+        </>
+      ),
+    },
+    {
+      title: '客户端 UI 文案是 locale 拥有的',
+      body: (
+        <>
+          产品文本走类型化字典与 <code>t</code>，或本地化的原语 props；
+          <code>verify-client-ui-i18n</code> 会拒绝硬编码文案。
+        </>
+      ),
+    },
+  ]}
+/>
+
+## HTTP 载体
+
+<Callout variant="note" title="dsh-host-webserver 不认识任何 harness 概念">
+  它<strong>不是 agent 循环的一部分，也不是能力 seam</strong>：一个 <code>node:http</code> 插件，提供{' '}
+  <code>ctx.webServer</code>、一个命名路由注册表、可选的 gzip 响应压缩、index.html 变换回调，以及一个插件可以认领的 fallback handler。
+</Callout>
+
+**每一个特性路由都由另一个插件注册**，包括 `/api` 桥、插件 bundle 与 HMR 事件流。它只服务浏览器：Electron 通过 `file://` 加载构建产物，并把 fetch 请求经 IPC 桥发送，而不走这个服务器。
+
+`ctx.clientModules` 则是同一件事的四个面：扫描 host Loader 的条目找出声明了 `dsh.client` 的包、组合 `window.__DSH_BOOT__` 的条目图、在 `/plugins` 下提供带版本的 combo 脚本，以及回答每一次 index 注入收集。它是 web GUI 栈的**可选能力**，并且是 `dsh-host-webserver` 的**消费者**——载体提供前缀路由与它所回答的 `webserver/index-inject` 事件。

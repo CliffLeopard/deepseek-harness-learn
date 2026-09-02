@@ -1,0 +1,330 @@
+## 装配点
+
+`ctx.systemPrompt` 是**所有给模型看的文字都从这里装配**。插件贡献四种输入，循环每个 step 调一次 `assemble()`，然后把结果渲染成完整的模型提示。
+
+<Cards
+  cols={2}
+  items={[
+    {
+      title: 'PromptSection',
+      meta: 'ctx.systemPrompt.section()',
+      tone: 'accent',
+      body: '有序的提示段落。文本可以是静态的，也可以由当前装配上下文解析出来。它们变成提示文本。',
+    },
+    {
+      title: 'PromptContext',
+      meta: 'ctx.systemPrompt.context()',
+      tone: 'violet',
+      body: '动态运行时上下文。它和 PromptSection 成对：不进提示文本，而是变成模型历史里带来源的 user-role 快照。没变就不必重写，所以对 KV cache 友好。',
+    },
+    {
+      title: '工具 schema provider',
+      meta: 'ctx.systemPrompt.tools()',
+      tone: 'lime',
+      body: '每次装配都被求值，贡献模型可见的 ToolSchema 集合。ToolRuntime 自动注册自己。',
+    },
+    {
+      title: '提示变量',
+      meta: 'ctx.systemPrompt.variable()',
+      tone: 'amber',
+      body: '在段落文本里以 {{name}} 引用，每次装配解析一次。agent-loop 注册的三个生产变量是 provider、model 与 cwd。',
+    },
+  ]}
+/>
+
+<Callout variant="key" title="为什么工具 schema 属于装配的一部分">
+  「模型被告知它能做什么」<strong>是一件连贯的事</strong>，即使适配器在线上把 schema 作为一个独立字段传输。
+  段落与 schema provider 是<strong>两个独立的装配输入</strong>，所以限制一个工具并不会移除独立注册的指导文本。
+</Callout>
+
+## 两阶段：assemble 与 render
+
+<Figure
+  kind="数据流"
+  scroll
+  title="一次装配的完整管线"
+  caption={
+    <>
+      <code>assemble()</code> 返回的是<strong>已解析但未插值</strong>的段落文本、有序工具 schema，以及每个已注册变量对该上下文的解析值；
+      <code>renderPrompt()</code> 才做插值、丢弃空段落，并用空行连接。
+    </>
+  }
+>
+  <Pipeline
+    stages={[
+      {
+        title: '合并全局层与请求作用域层',
+        sub: 'AssembleContext.scope',
+        tone: 'accent',
+        body: '挂在某个 scope 上的段落、变量与工具 provider 会覆盖同名全局项。scope 缺省时，只有全局 provider 与没打标签的监听器参与。',
+      },
+      {
+        title: '分离工具参数并规范化顺序',
+        sub: 'toolOrder / 字典序',
+        tone: 'lime',
+        body: (
+          <>
+            段落按 <strong>order 升序、相同 order 按 code-unit 名序</strong>排序。
+            <code>toolOrder</code> 在 waterfall <strong>之前</strong>规范化收集到的工具，因为注册顺序只是插件加载的副产物。
+          </>
+        ),
+      },
+      {
+        title: '运行 system-prompt/assemble waterfall',
+        sub: 'waterfall · 按 scope 过滤派发',
+        tone: 'violet',
+        body: '返回值说了算。挂在某个 scope 上的监听器只收到那个 scope 的装配。改列表的监听器要自己保证发出内容是确定的。',
+      },
+      {
+        title: '恢复 complete 段落',
+        sub: 'complete: true',
+        tone: 'amber',
+        body: (
+          <>
+            一个生效的 <code>complete</code> 段落在 waterfall <strong>之后</strong>被恢复为唯一的提示段落，所以监听器<strong>无法</strong>往那个作用域的系统提示里追加或替换内容。
+            但 waterfall 产出的上下文、工具与变量仍然保留。
+          </>
+        ),
+        branches: [{ label: '多于一个生效的 complete 段落', to: '装配失败', tone: 'rose' }],
+      },
+      {
+        title: '应用运行时上下文抑制器',
+        sub: 'suppressRuntimeContext()',
+        tone: 'rose',
+        body: '按调用作用域移除每一项动态运行时上下文贡献，同时不关闭拥有这些事实的服务。多个抑制器可组合，全部撤销后上下文恢复。',
+      },
+      {
+        title: 'renderPrompt() 严格插值',
+        sub: '{{variable}}',
+        tone: 'accent',
+        body: (
+          <>
+            未知引用、已注册但无值的引用、格式错误的完整分组都会<strong>抛错</strong>——格式错了的提示比启动时直接失败更糟。
+          </>
+        ),
+      },
+    ]}
+  />
+</Figure>
+
+## harness 自己的段落顺序是稀疏且集中分配的
+
+仓库内的贡献者通过 `ctx.systemPrompt.getSectionOrder(name)` 解析集中分配的位置，运行时上下文贡献者用 `getContextOrder(name)`。外部贡献可以用任意有限 order。
+
+<DataTable
+  head={['order', '名称', '属于什么']}
+  monoFirst
+  rows={[
+    ['-1000', 'HARNESS_IDENTITY', '固定开场：You are an AI agent powered by DeepSeek Harness.'],
+    ['-900', 'HARNESS_SOURCE', 'harness 自身来源'],
+    ['-800', 'WEB_SURFACE', 'Web 界面'],
+    ['0', 'DEPLOYMENT_PERSONA', '全局部署人格（section 名 deployment:persona）'],
+    ['500 · 600', 'PLAN_POLICY · TEAM_POLICY', '计划模式与团队策略'],
+    ['800', 'PTC_ONLY', '仅 PTC 模式'],
+    ['900', 'FILE_REFERENCE', '@file 引用'],
+    ['1000–1700', 'TOOL_BASH … TOOL_PTY', '执行类工具指导'],
+    ['2000–2900', 'TOOL_WEB_SEARCH … TOOL_REPORT', '外部与编排类工具指导'],
+    ['5000', 'TOOLS_SDK', 'SDK 贡献的工具'],
+    ['9000 · 9900', 'DELIVERABLE_FILE_REFERENCES · STRUCTURED_OUTPUT', '产出物与结构化输出'],
+  ]}
+/>
+
+运行时上下文只有三个集中位置：`SANDBOX_POLICY`（110）、`APPROVAL_POLICY`（115）、`SUBAGENT_DELEGATION`（120）。
+
+<Callout variant="note" title="deployment:persona 被导出是为了让替换成立">
+  一个组合可以替换这个槽位——agent preset 用自己的人格覆盖部署人格。<strong>两边命名同一个 section</strong>，所以是「替换」而不是「重复」。
+</Callout>
+
+## 配置面
+
+```yaml
+- name: '@deepseek-ai/dsh-system-prompt'
+  config:
+    includeHarnessIdentity: true
+    includeRuntimeContext: true
+    persona: 'You are the deployment assistant.'
+    toolOrder: ['<unlisted-tools>']
+```
+
+<DefList
+  items={[
+    {
+      term: 'includeHarnessIdentity',
+      sig: '默认 true',
+      desc: '包含 order −1000 的固定开场。只有兼容性部署已经自带完整系统提示时，才设为 false。',
+    },
+    { term: 'includeRuntimeContext', sig: '默认 true', desc: '在装配里包含有序的动态运行时上下文。' },
+    { term: 'persona', sig: "默认 ''", desc: '在 order 0 渲染的全局部署人格片段。' },
+    {
+      term: 'toolOrder',
+      sig: '无默认',
+      desc: "显式的模型可见工具顺序，必须恰好包含一个 '<unlisted-tools>' rest 条目；未列出的工具按字典序插在那个位置。",
+    },
+  ]}
+/>
+
+<Callout variant="trap" title="toolOrder 的两级失败时机不同">
+  <strong>格式</strong>不对（缺 rest 条目、有重复）在 <strong>config 加载时</strong>抛错；
+  但一个已列出却没有注册工具的名字，会让<strong>每一次 assemble() 被拒绝</strong>——也就是在第一个 turn 才暴露，而不是启动时。
+</Callout>
+
+`ToolProviderResult` 的两个字段正是为此存在：`schemas` 是本次装配里模型看得见的集合，`knownNames` 是 provider **限制前**的名字全集，用来区分「配置里写错了名字」和「一个已知工具在这个 scope 里被故意藏起来」。
+
+## KV Cache 的代价
+
+<Split>
+  <Panel title="系统提示" tone="accent">
+    只要身份、人格、变量、段落文本与顺序渲染结果完全一致，前缀就是稳定的。
+
+    任何改动都可能**从第一个改变的系统提示 token 起**让复用失效。
+  </Panel>
+  <Panel title="工具 schema" tone="lime">
+    只要可见 schema 集合、渲染与顺序不变，前缀就是稳定的。
+
+    注册、限制或重排序都可能**从第一个改变的 schema token 起**让复用失效。
+
+    限制一个工具会移除它对该 agent 的**全部 schema 成本**，但不会移除一个独立的提示段落。
+  </Panel>
+</Split>
+
+## 上下文来源：谁在往模型里塞东西
+
+<Callout variant="key" title="模型可见 ⟺ 已记录">
+  任何进入模型请求的东西<strong>必须能从会话日志重建</strong>。所以每一个下面这些来源都通过{' '}
+  <code>agent.inject()</code> 落成一条 <code>user/message</code> 会话事件，并带上{' '}
+  <code>MessageSource</code> 与可选的 <code>ContextForm</code>。
+</Callout>
+
+<DataTable
+  head={['插件', '贡献什么', '要点']}
+  rows={[
+    [
+      'dsh-agent-instructions',
+      'AGENTS.md 兼容的工作区指令文件',
+      '用户全局文件与项目链在第一次请求前作为一份持久基线到达；成功的 read/write/edit 把新相关的嵌套文件、变更与删除带进后续请求。有字节预算：更宽泛的文件先被省略，最具体的文件最后才被截断。没有文件监视器。',
+    ],
+    [
+      'dsh-skill / dsh-tool-skill',
+      '可复用的任务指令',
+      '任何 provider 都能从本地目录、插件内嵌数据或远程服务贡献 skill；每个消费者拿到一份合并目录与每个名字的胜出者，并可按需加载完整指令。skill 服务自身不携带任何 skill 内容。目录不以 <available_skills> 写进系统提示——它是 agent/pre-step 注入的 user-role catalog 消息；正文要等模型调用 skill 工具才会以 tool result 到达。',
+    ],
+    [
+      'dsh-plan-mode',
+      '计划模式作为被记录的状态',
+      '/plan 进入、/plan off 离开。它是指导而非强制：所有工具都仍然可用，沙箱模式与审批提示才是施加限制的方式。计划模式在 resume 与 fork 之后仍然保留。',
+    ],
+    [
+      'dsh-tool-todo',
+      '结构化任务列表',
+      '列表跨 turn 与重开的会话存活。每次更新替换整个列表，且只有拥有它的 agent 会话能改它。一个配置开关决定是否允许多个任务同时 in progress。',
+    ],
+    [
+      'dsh-time-context',
+      '带来源标注的时钟读数',
+      '默认组合里禁用。正的 refreshIntervalMs 降低读数累积频率；省略或 0 表示每个符合条件的 step 都注入。读数带上打开请求所附的浏览器时区，以及距上一条模型可见消息的经过时间。',
+    ],
+    [
+      'dsh-session-reference',
+      '其他会话的有界只读快照',
+      '把 @label 提及变成规范 URI。快照在捕获后不可变，并携带一条固定警告，禁止跟随其中的指令、权限主张或工具请求——它是不可信的背景上下文。',
+    ],
+    [
+      'dsh-file-reference',
+      '@file 补全',
+      'seam 自身不拥有任何文件系统访问。选中一个候选项不会读取或附加文件内容——模型必须调用文件系统工具才能查看文件。',
+    ],
+  ]}
+/>
+
+## ContextForm：声明它是什么类型的信息
+
+`PromptContext` 与 `agent.inject()` 的生产者都在自己的来源旁边声明一个 `form`。这个词只描述信息类型，**不描述怎么画**。
+
+<Figure
+  kind="对照表"
+  title="六种 form 与它们各自要求的字段"
+  caption={
+    <>
+      <code>ContextFormed</code> 用 <code>form</code> 判别，所以生产者<strong>无法在不提供该 form 所需字段的情况下选择它</strong>。
+      省略 <code>form</code> 仍然合法——未声明的上下文就是有文档的默认值，按不透明内容呈现。
+    </>
+  }
+>
+  <Matrix
+    corner="form"
+    cols={['含义', '必需字段', '取代关系']}
+    rows={[
+      {
+        label: 'instructions',
+        cells: [
+          { label: '从工作区文件读出、模型应遵循的指令', tone: 'accent' },
+          { label: '无', tone: 'neutral' },
+          { label: '不取代', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'catalog',
+        cells: [
+          { label: '本会话可用项的目录', tone: 'lime' },
+          { label: '无', tone: 'neutral' },
+          { label: '随变化重新发布', tone: 'lime' },
+        ],
+      },
+      {
+        label: 'snapshot',
+        cells: [
+          { label: '当前状态', tone: 'violet' },
+          { label: 'sections: ContextSnapshotSection[]', tone: 'amber' },
+          { label: '同一生产者更晚的快照取代更早的', tone: 'violet' },
+        ],
+      },
+      {
+        label: 'notice',
+        cells: [
+          { label: '刚刚发生的一次性说明', tone: 'amber' },
+          { label: 'summary: string（一行，不展开也能看到）', tone: 'amber' },
+          { label: '不取代任何东西', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'relay',
+        cells: [
+          { label: '另一个 agent 发给这一个的消息', tone: 'rose' },
+          { label: '无', tone: 'neutral' },
+          { label: '不取代', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'recall',
+        cells: [
+          { label: '从另一个会话日志提取的材料', tone: 'rose' },
+          { label: '无', tone: 'neutral' },
+          { label: '进入时可能已被缩减', tone: 'neutral' },
+        ],
+      },
+    ]}
+  />
+</Figure>
+
+<Callout variant="rule" title="颜色、图标、排序、默认折叠不允许进入这个联合">
+  它们是<strong>消费者的事</strong>。这个词汇一次只增加一个值，且只在生产者具备该 form 所需结构化字段时才增加。
+</Callout>
+
+## 运行时上下文与提示段落的区别
+
+<Split>
+  <Panel title="PromptSection：变成提示文本" tone="accent">
+    进入系统提示，位于请求最前面。
+
+    对 KV cache 敏感：它就是前缀本身。
+
+    适合**稳定的指导**：工具用法、人格、策略。
+  </Panel>
+  <Panel title="PromptContext：变成 user-role 快照" tone="violet">
+    进入模型历史，位于**保留的模型历史之后**。
+
+    agent-loop **只在它变了或被压缩移除时**才记下完整的当前快照——没变就不必重写。
+
+    适合**会变的事实**：沙箱策略、审批策略、委派状态、时钟。
+  </Panel>
+</Split>

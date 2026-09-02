@@ -1,0 +1,304 @@
+## 一条共享的硬约束
+
+<Callout variant="rule" title="应用形态只能是 dsh 加一个 profile">
+  每一个受支持的 Node 应用都从 <code>dsh</code> CLI 加一个命名 profile 开始。
+  自定义插件组合仍然是<strong>一个 profile 加若干有序的 patch 文件</strong>——而不是另一个可执行文件，也不是内联的应用树。
+</Callout>
+
+随产品发布的应用只有五个：
+
+<DataTable
+  head={['命令', '形态']}
+  rows={[
+    ['dsh web', '--profile web 的专用别名——浏览器 GUI'],
+    ['dsh --profile headless', '无界面单任务运行'],
+    ['dsh --profile sdk', 'SDK 服务端（TypeScript SDK 解析同版本的 dsh 依赖并选择它）'],
+    ['dsh --profile sdk-minimal', '仓库自有的独立 bundle，走同一个启动器'],
+    ['dsh --profile acp', 'Agent Client Protocol 服务器'],
+  ]}
+/>
+
+<Callout variant="warn" title="哪些东西不是 Harness 应用启动器">
+  vendored CLI、仅构建/仅测试用的可执行文件、直接的进程内插件挂载，以及私有的浏览器 WebWorker 预览。
+  <code>verify-application-entrypoints</code> 把每个包 bin、可执行源与根 demo 都归入一个显式类别，并<strong>拒绝任何绕过 dsh 的 Node 应用路径</strong>。
+</Callout>
+
+## 四条集成路径
+
+<Cards
+  cols={2}
+  items={[
+    {
+      title: 'SDK',
+      meta: 'stdio JSON-RPC 2.0 · TypeScript + Python',
+      tone: 'accent',
+      body: '进程外客户端把 harness 当子进程驱动。协议是纯库——无插件、无配置、无注册。',
+    },
+    {
+      title: 'ACP',
+      meta: 'Agent Client Protocol · 仅自动化',
+      tone: 'violet',
+      body: '受信程序驱动持久 agent。它为自动化而生——进程外 subagent、测试运行器、脚本控制器——而不是 DSH 的用户界面。',
+    },
+    {
+      title: 'Webhook',
+      meta: 'ctx.webhookRuntime · fire-and-forget',
+      tone: 'lime',
+      body: '把经过认证的外部投递变成可选的普通根 Session。运行时不保留任何投递或完成状态。',
+    },
+    {
+      title: 'Hook 桥',
+      meta: 'Claude Code · Codex',
+      tone: 'amber',
+      body: '让你已经写好的 hooks.json 在 harness 里原样工作。两个桥通过一个共享协议表现完全一致。',
+    },
+  ]}
+/>
+
+## SDK 线协议
+
+<Callout variant="key" title="一行一条 JSON-RPC 2.0 消息">
+  在调用方自己拥有的字节流上，每条消息以 <code>\n</code> 结尾。
+  <strong>同时带 id 与 method 的帧是请求，只有 id 是响应，只有 method 是通知；格式错误的行被忽略。</strong>
+</Callout>
+
+<DataTable
+  head={['方向', '方法', '载荷']}
+  rows={[
+    ['client→server', 'initialize', 'InitializeParams → InitializeResult'],
+    ['client→server', 'session/prompt', 'SessionPromptParams → SessionPromptResult（持久入队收据）'],
+    ['client→server', 'shutdown', '无参数 → {}'],
+    ['server→client', 'session.event', 'SessionEventNotification（运行时里每一个会话，不过滤）'],
+    ['server→client', 'session.status', 'SessionStatusNotification（整 agent 的 running/idle 迁移）'],
+    ['server→client', 'subagent.started', 'SubagentStartedNotification'],
+    ['server→client', 'subagent.finished', 'SubagentFinishedNotification（仅进程内运行）'],
+  ]}
+/>
+
+错误语义也是固定的：没有注册 handler 的请求答 `-32601`，handler 失败答 `-32603`，错误响应以 `JsonRpcResponseError` 拒绝挂起的请求并**保留线上的 `code` 与可选 `data`**。`start()` 挂上流监听器，`close()` 摘掉它们并拒绝挂起请求，**但不销毁流**。
+
+<Callout variant="trap" title="messageId 不标识后来的任何东西">
+  <code>SessionPromptResult.messageId</code> 标识的是<strong>被排队的那条用户消息</strong>——
+  它不标识后来的助手消息、turn 结束，也不标识 prompt 的结果。
+</Callout>
+
+握手也是硬的：服务端在初始化期间**解析确切路由**，并在握手成功之前**拒绝 `session/prompt`**。所以缺失的适配器、不可用的模型或不支持的 reasoning effort **不可能回退到构造器默认值**。
+
+<Callout variant="warn" title="stdout 只承载 JSON-RPC 帧">
+  所以一个部署<strong>不得</strong>组合任何 stdout logger。
+  <code>dsh-sdk-jsonrpc-server</code> 用 dispose 根运行时并 exit 0 来回答 <code>shutdown</code>；
+  EOF 与信号退出归应用 bin 所有。
+</Callout>
+
+## 两个 SDK 是设计上的孪生
+
+<Split>
+  <Panel title="TypeScript：dsh-sdk-client" tone="accent">
+    `DeepSeekHarness` 用来 spawn 运行时、打开会话、发 prompt，并收集最终响应加上事件与通知流；`HarnessClient` 给出对协议层的显式控制。
+
+    启动 spec 是**显式**的：调用方可以用 `dshBin` 点名运行时可执行文件，省略则解析同版本 `@deepseek-ai/dsh` 包的 bin，参数由客户端构造。
+
+    它是纯库：**在 Cordis context 上不注册任何东西**，它 spawn 的运行时是一个完整 harness，其组合由那个运行时自己的 `cordis.yml` 决定。
+  </Panel>
+  <Panel title="Python：deepseek-harness-sdk" tone="violet">
+    运行时 wheel 把普通的 `dsh` CLI 打包成 `deepseek-harness-runtime-bin`，客户端默认启动 `dsh --profile sdk`。
+
+    可运行的最小示例选择随产品发布的独立 `sdk-minimal` profile；同一个运行时也打包了 `dsh web` 与它的前端资源，供单独的 CLI 使用。
+
+    **每一次启动都要求显式选择 Harness home——Python 从不静默读取 `~/.dsh`。**
+  </Panel>
+</Split>
+
+<Callout variant="note" title="Python 镜像而不 import 这些类型">
+  所以改动这里的一个方法、载荷，或线上稳定的 <code>serverInfo.name</code>，都需要在<strong>同一个改动</strong>里更新 Python 一侧与 TypeScript 客户端。
+  两个 SDK 都跟着这个循环走：agent-loop、会话生命周期与 <code>SessionEventMap</code> 的改动要在同一个 PR 里更新两侧的期望输出。
+</Callout>
+
+<Callout variant="trap" title="两个已知空缺">
+  <strong>没有 cancel 或 session-close 方法</strong>——客户端通过关闭运行时进程来放弃一个 turn。
+  <strong>server→client 请求是一个死能力</strong>——传输支持它，但服务端从不发送；Python SDK 的应答面是为将来的审批流预留的。
+</Callout>
+
+## ACP：仅自动化的语义
+
+<Callout variant="key">
+  它发出<strong>标准的</strong> ACP 消息、thought、通用工具生命周期、配置与上下文用量，
+  <strong>从不</strong>发出 DSH 私有的展示数据或方法。
+</Callout>
+
+<DefList
+  items={[
+    { term: '支持', sig: '会话生命周期', desc: '创建或恢复会话、列出可恢复会话、挂载标准 MCP 服务器、选择模型与 reasoning effort、prompt 或取消工作，以及关闭一个会话而不影响其他会话。' },
+    {
+      term: '依赖',
+      sig: '会话持久化',
+      desc: '会话持久化让 list、resume 与 close 能跨进程重启工作。',
+    },
+    {
+      term: '不支持',
+      sig: '明确的空缺',
+      desc: '删除、fork、转录回放、额外目录，以及交互式 UI 界面。',
+    },
+    {
+      term: '仓库自己的 ACP 客户端',
+      sig: 'dsh-subagent-acp',
+      desc: '也就是 subagent seam 的 acp provider。pnpm dsh --profile acp 启动一个即用的服务器。',
+    },
+  ]}
+/>
+
+## Webhook：故意做成无状态
+
+<Figure
+  kind="生命周期"
+  title="从一次外部投递到一个根 Session"
+  caption={
+    <>
+      <code>dispatch()</code> 快照匹配到的规则、各自独立调度，并<strong>在任何回调 settle 之前就返回</strong>。
+      抛错与 reject 按规则隔离。注册被 dispose 时会<strong>先移除规则，再中止并等活跃调用结束</strong>，
+      所以后来的投递不可能进入正在卸载的代码。
+    </>
+  }
+>
+  <Pipeline
+    stages={[
+      {
+        title: 'provider 适配器拥有认证与通用 JSON 接收',
+        sub: 'dsh-webhook-github',
+        tone: 'accent',
+        body: '在注入的 WebServer 上注册一条确切路由，逐请求解析它的凭据引用，在解析之前先校验未被触碰的 application/json 主体，并在内存派发之后立即返回 202。',
+      },
+      {
+        title: '运行时校验、分离并冻结整个投递值',
+        sub: 'VerifiedWebhookDelivery',
+        tone: 'violet',
+        body: 'kind、配置的 source、provider 的 deliveryId、规范化的 event，以及非负安全整数 receivedAt。冻结发生在派发给多于一个规则之前。',
+      },
+      {
+        title: '受信的编程规则拥有条件与外部调用',
+        sub: 'run(delivery, signal)',
+        tone: 'amber',
+        body: '回调可以执行任意受信代码。它返回 null 或一个 WebhookSessionRequest，并且必须观察 signal，好让注册卸载时该停的异步工作能停。',
+      },
+      {
+        title: '运行时创建挂在 Workspace 上的 Session',
+        sub: '唯一的内置动作',
+        tone: 'lime',
+        body: '校验权限与 agent preset，解析或创建规范 Workspace，创建一个 Session cwd 等于 Workspace 路径的 Agent，在发布之前挂载选定的 agent preset，并在应用权限、标题与初始 follow-up 之前把 Session 持久附着。',
+      },
+      {
+        title: '被接受的 inbox 插入提交这次 webhook 操作',
+        tone: 'rose',
+        body: 'follow-up 是一条普通的持久 user-role 消息，source.kind 为 "webhook"，带 provider/source/delivery/rule 来源。运行时不特别 flush，也不等待那个 turn。',
+      },
+    ]}
+  />
+</Figure>
+
+<Callout variant="warn" title="运行时没有队列、重试、去重、执行状态、崩溃重放或完成结果">
+  <strong>重复投递可能创建重复 Session。</strong>delivery id 只是来源标注——运行时既不存储也不据此去重。
+  唯一的活跃操作表是私有的 teardown 记账，随进程消失。
+</Callout>
+
+失败路径也定义清楚了：附着失败会在 prompt 存在之前 dispose 新 Agent；附着成功、prompt 被接受之前失败，会尝试 Workspace detach 与 Agent dispose，且**不替换原始错误**；预检期间自动创建的 Workspace **会保留**，因为另一个并发调用方可能已经在用它。
+
+<Callout variant="note" title="GitHub 评审指南把这条路由挂在一个隔离的第二个 WebServer 上">
+  这样<strong>暴露 webhook 入口不会同时暴露浏览器 API</strong>。
+</Callout>
+
+## Hook 桥：一个协议，两种方言
+
+<Callout variant="key" title="你从不直接选择 dsh-hook-protocol">
+  选 <code>dsh-hooks-claude-code</code> 或 <code>dsh-hooks-codex</code>，把它指向你已有的{' '}
+  <code>hooks.json</code>，这套规则就会应用到你的 hook 上。
+</Callout>
+
+一个 hook 能做的事：
+
+<Steps
+  items={[
+    {
+      title: '用一条消息阻止一个动作',
+      body: '以退出码 2 退出的 hook 会停掉这个 prompt 或工具调用，它的错误输出被当作理由展示。',
+    },
+    {
+      title: '在工具运行之前询问',
+      body: 'Claude Code 的 hook 可以请求确认而不是直接阻止；Codex 桥不暴露这个选项。',
+    },
+    {
+      title: '附加上下文',
+      body: 'hook 可以返回额外文本，模型会在下一次请求里看到它。',
+    },
+    {
+      title: '在选定的时机运行',
+      body: (
+        <>
+          hook 配置按名字或模式选择它在哪些事件上触发；<strong>缺省、空或 <code>'*'</code> 模式表示该类的每一个事件</strong>。
+        </>
+      ),
+    },
+    {
+      title: '失败但不停止运行',
+      body: '除 2 以外的任何退出码都是非阻塞失败：动作继续，失败被记录；一个根本无法启动的 hook 同样处理。',
+    },
+    {
+      title: '请求停止运行',
+      body: (
+        <>
+          hook 可以请求整体停止（<code>{'{"continue": false}'}</code>），
+          <strong>这个请求会被记录，但没有运行级效果</strong>。
+        </>
+      ),
+    },
+  ]}
+/>
+
+<Callout variant="trap" title="只有 command 形态的 hook 会运行">
+  协议执行 <code>{"{ type: 'command', command, timeout? }"}</code>；
+  桥会解析并跳过它方言里定义的其他形态（<code>http</code>、<code>mcp_tool</code>、
+  <code>prompt</code>、<code>agent</code>），并给出警告。
+</Callout>
+
+## 合并规则与降级纪律
+
+<Figure
+  kind="决策树"
+  title="多个匹配到的 hook 如何折叠成一个结果"
+  caption={
+    <>
+      每一步都<strong>降级为一个被隔离的结果而不是抛错</strong>，所以一个 hook 永远不可能弄崩调用它的那个 turn。
+    </>
+  }
+>
+  <Fanout
+    source={{ title: 'mergeHookOutputs', kind: 'gate', tone: 'amber' }}
+    targets={[
+      { label: 'deny > ask > allow', title: '最严格者胜出', sub: '优先级折叠', tone: 'rose' },
+      { label: 'continue: false', title: '第一个 stop 是粘性的', sub: '被记录但无运行级效果', tone: 'amber' },
+      { label: 'context', title: '按 hook 顺序累积', sub: '模型在下一次请求里看到', tone: 'lime' },
+    ]}
+  />
+</Figure>
+
+具体的降级路径：无效的正则是**不匹配**；执行器 reject 变成一个**没有退出码**的 `HookOutput`；退出 2 以 stderr 为理由阻止；其他任何失败都保持**非阻塞**。
+
+<Callout variant="rule" title="方言之间只差一个轴">
+  差异只在<strong>如何解释一个 matcher 模式</strong>：<code>claude-code</code>{' '}
+  把模式解释成字面备选项或一个正则，<code>codex</code> 总是解释成一个未锚定的正则。
+  所以 matcher 把 mode 作为<strong>参数</strong>，而不是把引擎复制两遍。
+</Callout>
+
+## hook/* 会话事件
+
+`hook/invoked` 与 `hook/result` 通过声明合并进入 `SessionEventMap`，是**仅日志**记录：和 `compaction/*` 一样，它们**不是** surface 事件，也不携带 `surfaceOp`。一个 `hook/result` 通过 `handlerId` 与它的 `hook/invoked` 配对。
+
+<Callout variant="key" title="调用与结果记录必须落在一个打开的 turn 里">
+  <code>UserPromptSubmit</code>、<code>PreToolUse</code>、<code>PostToolUse</code> 与{' '}
+  <code>Stop</code> 按构造就满足这个关系；而 <strong><code>SessionStart</code> 在 turn 1 之前运行，因此拿不到 hook/* 记录</strong>——它注入的上下文改为通过 inbox 投递，直到一次唤醒性投递打开一个 turn。
+</Callout>
+
+不变量伴生插件注册在 `ctx.invariants` 上，拒绝以下情况：`hook/*` 事件被追加在打开的 turn 之外、一个没有匹配 invoked 的 result、未知方言，以及非有限的 duration。
+
+<Callout variant="warn" title="什么时候不该用 hook 桥">
+  为没有参考工具对等物的定制行为——那时候应该写<strong>原生 Cordis 插件</strong>，它拥有完整的 harness API，中间不隔一层 hook 协议。
+</Callout>

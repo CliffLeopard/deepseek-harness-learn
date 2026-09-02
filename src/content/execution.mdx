@@ -1,0 +1,406 @@
+## 一个执行世界，五个 seam
+
+<Callout variant="key">
+  同一个 provider 的 spawn 工作目录、可执行文件路径、普通进程与终端会话，
+  <strong>与挂载的文件系统 provider 处在同一个路径与进程命名空间里</strong>。
+  这就是把执行世界整体换到远程沙箱只需替换两个基础 provider 的原因。
+</Callout>
+
+<Figure
+  kind="架构图"
+  title="执行世界的分层"
+  caption={
+    <>
+      <code>ctx.subprocess</code> 是最底下的共享层。<code>ctx.sandbox</code> 不 spawn 任何东西——它只<strong>包裹 argv</strong>，由消费者去 spawn。
+    </>
+  }
+>
+  <Layers
+    rows={[
+      {
+        title: '给模型用的工具',
+        meta: 'Consumer',
+        tone: 'neutral',
+        chips: [
+          { title: 'bash' },
+          { title: 'pwsh' },
+          { title: 'read / write / edit' },
+          { title: 'glob / grep' },
+          { title: 'pty' },
+          { title: 'lsp' },
+        ],
+        note: '消费者不知道自己跑在哪个执行器上。',
+      },
+      {
+        title: '能力 Service Definition',
+        meta: 'ctx 上的抽象服务',
+        tone: 'accent',
+        chips: [
+          { title: 'ctx.shell' },
+          { title: 'ctx.fs' },
+          { title: 'ctx.terminals' },
+          { title: 'ctx.lsp' },
+        ],
+      },
+      {
+        title: '策略与约束',
+        meta: 'Policy 插件',
+        tone: 'amber',
+        chips: [
+          { title: 'ctx.sandboxPolicy' },
+          { title: 'ctx.sandbox' },
+          { title: 'fs-observation-policy' },
+          { title: 'tool-call-timeout-policy' },
+        ],
+        note: '策略不注册能力服务，它通过事件检查点加约束。',
+      },
+      {
+        title: '共享执行世界',
+        meta: 'packages/subprocess',
+        tone: 'lime',
+        chips: [
+          { title: 'ctx.subprocess' },
+          { title: 'subprocess-local' },
+          { title: 'subprocess-e2b' },
+        ],
+        note: 'spawn 工作目录、可执行路径、普通进程与终端会话都在这一层的同一个命名空间里。',
+      },
+      {
+        title: '宿主',
+        meta: 'OS / 远程运行时',
+        tone: 'neutral',
+        chips: [
+          { title: '进程树' },
+          { title: 'PTY' },
+          { title: '文件系统' },
+          { title: '远程 Linux 沙箱' },
+        ],
+      },
+    ]}
+  />
+</Figure>
+
+## 请求与规格分离：resolve() 是显式的一步
+
+这是全仓库「显式优于隐式」规则最标准的模板。
+
+<Split>
+  <Panel title="ShellExecRequest：给模型/插件用" tone="violet">
+    `workdir`、`timeoutMs`、`stdoutMaxBytes` 都是**可选**的。
+
+    另外还有仅限**受信进程内插件**的字段：`stdin`、`env`、`stdoutMaxBytes`——`dsh-tool-bash` **不把它们暴露成参数**。需要 stdin 的模型用 shell 语法（heredoc 或管道）。
+  </Panel>
+  <Panel title="ShellExecSpec：执行器实际执行的" tone="lime">
+    那些字段变成**必需**的，由 `ctx.shell.resolve(request)` 从实现的配置里填充并设上限。
+
+    `start()` 忽略 `timeoutMs`，因为后台进程没有执行器超时。
+  </Panel>
+</Split>
+
+<Callout variant="rule" title="默认值不是 run() 里的一个 ?? ">
+  defaulting 是<strong>拥有该实现的那一方的一个显式 resolve(request): Spec 步骤</strong>，永远不是{' '}
+  <code>run()</code> 内部一个隐藏的 <code>?? default</code>。
+</Callout>
+
+## DSH_* 是被管理的命名空间
+
+`DSH_*` 变量是 harness 拥有的子进程事实。合并顺序是硬的：
+
+<Pipeline
+  stages={[
+    { title: '凭据擦洗', sub: 'credential scrub', tone: 'rose', body: '本地执行器先擦掉环境里的凭据。' },
+    {
+      title: '丢弃继承来的 DSH_* 名字',
+      tone: 'amber',
+      body: '这样一个当前不可用的事实就不可能从 harness 进程继承到一个过期值。',
+    },
+    { title: '合并调用方显式的 env', sub: 'ShellExecRequest.env', tone: 'violet', body: '受信进程内插件的普通环境条目。' },
+    {
+      title: '最后合并 dshEnv 快照',
+      sub: 'DshEnvironment（类型化的受管键）',
+      tone: 'lime',
+      body: '因为它最后合并，一个调用方的 env 条目永远无法顶掉一个受管条目。',
+    },
+  ]}
+/>
+
+## 前台运行的结果：正交事实各占一个字段
+
+```ts
+/** The outcome of one completed (or killed) foreground run. */
+interface ShellRunResult {
+  /** Exit code; null when the process died from a signal. */
+  exitCode: number | null
+  /** Terminating signal (e.g. 'SIGTERM'); null on normal exit. */
+  signal: NodeJS.Signals | null
+  timedOut: boolean
+  aborted: boolean
+  // …
+}
+```
+
+<Callout variant="key" title="一个进程可以既超时又 exit 0">
+  因为它<strong>捕获了信号</strong>。所以 <code>timedOut</code>、<code>aborted</code>、
+  <code>signal</code>、<code>exitCode</code> 各自是独立字段——调用方<strong>不会</strong>把一次被砍断的运行读成干净的成功。
+</Callout>
+
+`timedOut` 与 `aborted` 互斥：一个融合的 deadline 同时驱动执行器超时与调用方取消，所以在进程 close 之前竞态到达的超时与 abort 只报告**第一个原因**，不会两个都报。
+
+## 子进程 seam：完全显式的 spawn 规格
+
+<Callout variant="rule" title="seam 不施加任何默认值">
+  每一个 disposition、上限与目录都<strong>显式写在 spec 上</strong>，所以决定它们的是调用方自己的配置，而不是一个隐藏的 subprocess 服务默认值。
+  <code>argv</code> <strong>不会</strong>被 shell 解释。
+</Callout>
+
+<DefList
+  items={[
+    {
+      term: 'resolveExecutable(command, env?, signal?)',
+      sig: '可执行文件查找',
+      desc: '校验绝对可执行路径；裸名字则用 provider 擦洗后的 PATH，再叠上有意的覆盖来解析。',
+    },
+    {
+      term: 'stdio disposition',
+      sig: 'pipe / inherit / collect',
+      desc: '每条流各自显式选择：raw pipe 用于协议分帧（LSP JSON-RPC、ACP ndjson），inherit 用于透传诊断，collect 用于有界的批量输出。collect 的 spill 文件是可选的，所以一个诊断尾巴（语言服务器的 stderr）可以缓冲而不留下文件。',
+    },
+    {
+      term: 'collect-mode reader',
+      sig: '整流字节偏移',
+      desc: '读取器取整条流的字节偏移且从不消费，所以互相独立的读取器不会偷走彼此的增量。piped 流归调用方所有。',
+    },
+    {
+      term: 'terminate()',
+      sig: '唯一的终止动词',
+      desc: '唯一的终止动词，且在每个平台上都是树作用域的。POSIX 对分离的进程组做 SIGTERM → graceMs → SIGKILL；Windows 经 taskkill /T 立刻强杀，没有那一级宽限期。waitForExit() 观察整棵树，而不只是直接子进程。',
+    },
+    {
+      term: 'spawnTerminal(spec)',
+      sig: '非管道进程原语',
+      desc: 'provider 分配控制终端，并拥有 UTF-8 文本传输、前台进程组的检查与发信号，以及一次被 await 的 TERM-to-KILL 操作。',
+    },
+  ]}
+/>
+
+<Callout variant="trap" title="done 只报告退出事实，不做原因分类">
+  服务会在 abort 时杀掉进程，但<strong>从不决定为什么</strong>——调用方读它自己拥有的那个 deadline signal，
+  例如 bash 执行器的 <code>timedOut</code> / <code>aborted</code> 划分。
+</Callout>
+
+## 沙箱：只管文件效果，失败就直接拒绝
+
+<DataTable
+  head={['SandboxMode', '含义']}
+  rows={[
+    ["'read-only'", '要求后端拒绝写。POSIX runner 额外放行 shell 需要的 /dev/null sink；Windows ACL runner 不授予任何显式可写根，并对其环境 ACL 缺口报告 partial'],
+    ["'workspace-write'", '允许在工作区根与后端承诺的临时区域下写'],
+    ["'danger-full-access'", '绕过约束——这类消费者 spawn 它原本的 argv，根本不调用 ctx.sandbox'],
+  ]}
+/>
+
+<Callout variant="warn" title="网络与进程可见性不在这个词汇表里">
+  <code>SandboxMode</code> <strong>只</strong>管文件效果。容器、microVM 与远程执行是<strong>整个能力 seam 的兄弟实现</strong>，而不是 <code>ctx.sandbox</code> 的 provider。E2B 替换的是 <code>ctx.fs</code> 加 <code>ctx.subprocess</code> 这整个执行世界，不是往 <code>ctx.sandbox</code> 再挂一个后端。
+</Callout>
+
+本地 provider 按平台选一条 runner 链；没有可用 runner 时，<code>confine</code> 对受约束策略 <strong>fail-closed</strong>，不会无隔离地跑命令。策略服务的部署默认 mode 是 <code>read-only</code>。
+
+<DataTable
+  head={['平台', '链顺序', 'enforcement']}
+  rows={[
+    ['linux', 'bwrap → landlock', 'full；较老的 Landlock ABI 可报告 partial'],
+    ['darwin', 'sandbox-exec（Seatbelt）', 'full'],
+    ['win32', 'windows-acl', '永远 partial（WRITE_RESTRICTED、硬链接等边界）'],
+  ]}
+/>
+
+约束程度是一个**被报告的事实**，不是一个假设：
+
+<Split>
+  <Panel title="enforcement: 'full'" tone="lime">
+    后端管住了该 mode 承诺的**每一项**文件效果。
+  </Panel>
+  <Panel title="enforcement: 'partial'" tone="amber">
+    一个活跃后端或较老的内核 ABI 只管住了**一个子集**。
+
+    需要绝对边界的消费者**必须拒绝或把这个区别暴露出来**。当前的 partial 情形是较老的 Landlock ABI 与 Windows ACL runner 的 Everyone / 硬链接边界。
+  </Panel>
+</Split>
+
+## 逐调用的策略，而不是固定在 provider 上
+
+```ts
+/**
+ * What one confined execution is allowed to touch — carried PER CALL, not
+ * fixed on the provider.
+ */
+interface SandboxPolicy extends SandboxExecutionPolicy {
+  mode: ConfinedSandboxMode
+}
+```
+
+<Callout variant="key">
+  两个消费者可以在<strong>同一瞬间</strong>用不同策略约束——bash 在 <code>read-only</code> 下，而一个被约束的子 agent 需要它的状态目录可写。
+  一次被批准的升级重试就是<strong>一个带更宽策略的新调用</strong>，而不是去改 provider 状态。
+</Callout>
+
+`ctx.sandboxPolicy.resolve(request)` 拥有优先级与根回退，好让 bash 与 fs 不必各自重复一遍：
+
+<Timeline
+  items={[
+    { at: '最高', title: '被批准的显式 mode 覆盖', body: '来自一次审批过的升级重试。', tone: 'rose' },
+    { at: '其次', title: '会话最后一条 sandbox/mode 事件', body: '会话自己的 mode 日志。', tone: 'amber' },
+    { at: '最低', title: '部署默认值', body: '配置里的默认 mode。', tone: 'accent' },
+  ]}
+/>
+
+工作区根从**调用会话不可变的 cwd** 算出来；没有 agent 的调用才退回部署配置。这个根会先按**文件系统语义**规范化再做词法规范化，所以一个包含 `symlink/..` 的 cwd 标识的是被 spawn 的进程**实际运行的那个目录**。
+
+## 两类 stderr 分类器，顺序不能颠倒
+
+`ctx.sandbox.confine(argv, policy)` 返回 `ConfinedArgv`——消费者要 spawn 的替换 argv，加上后端的约束事实与两个**正交**的分类器。
+
+<Figure
+  kind="决策树"
+  title="消费者必须先检查 runner 失败，再检查拒绝"
+  caption={
+    <>
+      <strong>runner 失败意味着命令根本没跑；拒绝意味着约束正常工作并挡住了它。</strong>
+      混淆两者会把一次沙箱基础设施故障报告成一次普通任务失败。
+    </>
+  }
+>
+  <Fanout
+    source={{ title: '一次失败运行的 stderr', kind: 'gate', tone: 'amber' }}
+    targets={[
+      {
+        label: '① runnerFailureRules',
+        title: '沙箱基础设施失败',
+        sub: '需要非零退出 + exit-code gate + fatal 签名',
+        tone: 'rose',
+      },
+      {
+        label: '② denialSignatures',
+        title: '约束正常，命令被挡',
+        sub: '按后端方言匹配，不用跨后端并集',
+        tone: 'violet',
+      },
+      { label: '两者都不匹配', title: '普通任务失败', sub: '交给模型', tone: 'lime' },
+    ]}
+  />
+</Figure>
+
+<Callout variant="trap" title="退出状态本身永远不能证明 runner 失败">
+  规则要求：先应用 <code>allowedExitCodes</code>（若有），再按<strong>整行大小写不敏感相等</strong>移除{' '}
+  <code>informationalLines</code>，最后在<strong>剩下的每一行</strong>里大小写不敏感地匹配{' '}
+  <code>fatalSignatures</code>。这样一条无害的 runner 通告就无法单靠自己证明失败。
+</Callout>
+
+`denialSignatures` 是**后端方言**：bwrap 的只读绑定产生 EROFS 文本，Landlock 产生 EACCES，Seatbelt 产生 EPERM。消费者只匹配**这一批**，而不是跨后端并集——并集会声称某个后端从不产生的拒绝。
+
+<Callout variant="warn" title="受约束策略下，不能静默改成无约束透传">
+  没有可用后端时，<code>confine</code> 抛出 <code>SandboxUnavailableError</code>，code 为{' '}
+  <code>SANDBOX_UNAVAILABLE</code>。这就是 fail-closed。
+</Callout>
+
+## 文件系统：目标身份与 read-before-edit
+
+每个操作先把用户提供的路径解析成一个**不透明的后端目标**。消费者可以展示 `displayPath`，但**不得解析** `targetKey`（一个带品牌的不透明 id），也不得假设它是本地绝对路径。
+
+<Callout variant="trap" title="glob / grep 不走 ctx.fs">
+  <code>read</code> / <code>write</code> / <code>edit</code> 注入 <code>ctx.fs</code>。
+  <code>glob</code> 与 <code>grep</code> 走 <code>ctx.subprocess.spawn</code> 加上打包的 ripgrep——它们不 inject 文件系统服务。
+  所以换掉 <code>fs-local</code> 不会自动改搜索行为；搜索跟随的是执行世界里的 subprocess provider。
+</Callout>
+
+<Figure
+  kind="状态图"
+  title="观察状态如何决定写与编辑的意图"
+  caption={
+    <>
+      观察状态是 <code>dsh-fs-observation-policy</code> 插件内部持有的一个{' '}
+      <code>{'WeakMap<owner, Map<targetKey, FsObservation>>'}</code>。
+      这个策略插件<strong>不注册任何服务</strong>，也<strong>不做任何文件系统 I/O</strong>——它只通过{' '}
+      <code>fs/*</code> 事件检查点加策略。
+    </>
+  }
+>
+  <Matrix
+    corner="观察状态"
+    cols={['write 决策', 'edit 决策']}
+    rows={[
+      {
+        label: 'unseen（map 里没有条目）',
+        cells: [
+          { label: 'createIfAbsent', tone: 'lime' },
+          { label: 'FS_NOT_OBSERVED', tone: 'rose' },
+        ],
+      },
+      {
+        label: "{ kind: 'absent' }",
+        cells: [
+          { label: 'createIfAbsent', tone: 'lime' },
+          { label: 'FS_NOT_FOUND', tone: 'rose' },
+        ],
+      },
+      {
+        label: "{ kind: 'present', version }",
+        cells: [
+          { label: 'replaceIfVersion', tone: 'amber' },
+          { label: '它的 version guard', tone: 'amber' },
+        ],
+      },
+    ]}
+  />
+</Figure>
+
+<Callout variant="key" title="授权是基于新鲜度的，不是基于「读全了没有」">
+  <code>read</code> 工具直接发出一条<strong>带 stat 版本的 present 观察</strong>，所以<strong>任何窗口化的读</strong>都能在文件未变更时授权后续的 write/edit。
+  没有 full/partial 视图之分——读结果纯粹是展示性的。
+</Callout>
+
+一次元数据 miss 会在工具返回 `FS_NOT_FOUND` **之前**发出一条 absent 观察，这让后续一次带 guard 的 write 能够**重建一个被外部删掉的目标**，同时**不授权 edit**。
+
+## 文件 IO 上没有超时
+
+<Callout variant="rule">
+  <code>read</code> / <code>write</code> / <code>edit</code> <strong>不接受</strong>{' '}
+  <code>timeoutMs</code>，provider 契约也不武装任何 deadline。
+</Callout>
+
+对比一下：bash 与 web 消费 `@deepseek-ai/dsh-timeout`，由子进程支撑的 `glob` / `grep` 声明的 `timeoutMs` 由 `dsh-tool-call-timeout-policy` 强制——**这些都是进程支撑的，deadline 真的能杀掉工作**。
+
+而一次本地 syscall 最多只能做到 best-effort 可中止：一个超时无法强迫进行中的 `fsync` / `rename` 停下来。所以这里放一个 `timeoutMs` 会是**一个 seam 根本无法强制的 deadline**，而且正好落在「显式优于隐式」所禁止的位置上。取消仍然通过工具执行 signal 传播，在 syscall 边界做 best-effort abort。
+
+## 错误分类是稳定字符串
+
+文件系统失败使用稳定的 `FsErrorCode` 字符串，由 `FsError`（一个 `HarnessError`）携带。工具注册表在错误结果上**保留 `{ name, code }`**，所以重试层、权限层与 UI 层可以分支而不必解析文本。
+
+## 持久终端
+
+<DefList
+  items={[
+    {
+      term: 'TerminalSessionId',
+      sig: '服务铸造的带品牌 id',
+      desc: '可选的名字只是 owner 本地的展示元数据；授权比较的是确切的拥有者 Agent，不是名字，也不是猜出来的 id。',
+    },
+    {
+      term: '后端',
+      sig: 'terminal-bash',
+      desc: '后端拥有一个注册类型如何启动与如何检测就绪。服务只在 setup 成功之后才发布返回的会话，然后拥有 id 授权与清理。',
+    },
+    {
+      term: 'TerminalBackendCleanupError',
+      sig: '清理失败',
+      desc: '无法清理部分启动资源的后端用它拒绝，这让 dispose 能保留清理失败而不替换掉调用方的取消原因。',
+    },
+    { term: '并发', sig: '一个活会话一次一个 send', desc: '它的操作对通用后台作业暴露一个消费式输出游标，并给前台调用方一个终端结果。' },
+  ]}
+/>
+
+<Callout variant="note" title="PTY 状态是进程本地的，但模型输入与输出是持久的">
+  模型输入与有界的返回输出通过既有的 <code>tool/call</code>、<code>tool/result</code>{' '}
+  与任务结果路径持久化，<strong>而不是</strong>另造一套重复的 PTY 会话事件。
+  会话在后端或工具插件重载后仍然存活。
+</Callout>

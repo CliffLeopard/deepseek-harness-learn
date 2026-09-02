@@ -1,0 +1,404 @@
+## 一个概念一个词
+
+<Callout variant="rule" title="代码里怎么写，这里就怎么叫">
+  <code>turn</code>、<code>scope</code>、<code>seam</code> 这些词在源码、事件名、文档和 PR 里必须指同一件事。
+  本站不另起中文别名。遇到看不懂的词，先来这里对齐，再去读源码。
+</Callout>
+
+<Callout variant="trap" title="最容易混用的三组词">
+  <strong>turn / step / round</strong>——三层循环，不是同义词。
+  <strong>seam / provider / service</strong>——seam 是完整能力，不是其中某一个角色。
+  <strong>goal / round / Ralph</strong>——goal 是状态，round 是计数，Ralph 是一种工具策略。
+</Callout>
+
+## 循环层级
+
+<DefList
+  items={[
+    {
+      term: 'turn',
+      sig: '把 inbox 里已接收的输入处理完',
+      desc: '会话里一次把已接收输入处理完的过程。模型及其工具都停了，或者终止策略介入，turn 就结束。',
+    },
+    {
+      term: 'step',
+      sig: '一次模型请求 + 它引发的工具执行',
+      desc: '一个 turn 里可以有零个或多个 step。被拦住的 turn 一个 step 都不会有，这是合法的。',
+    },
+    {
+      term: 'round',
+      sig: '包在 turn 外面的策略循环',
+      desc: '例如一个 Goal Round，或 Ralph 里一次换全新 agent 的尝试。计数器归那套策略所有，不统计会话里每一个 turn。',
+    },
+    {
+      term: 'inbox',
+      sig: '输入队列',
+      desc: 'turn 要处理的就是它。followup / steer / inject 三种投递都进这里，决定下一个 turn 看到什么。',
+    },
+  ]}
+/>
+
+<Callout variant="key" title="为什么必须区分">
+  改「循环行为」时，先问这件事落在哪一层。放错层，subagent、恢复或压缩之后就会对不上。
+</Callout>
+
+## seam
+
+<DefList
+  items={[
+    {
+      term: 'seam',
+      sig: '定义 + 实现 + 消费者',
+      desc: '一项可替换的能力。必须同时有 Service Definition、一个或多个 Service Provider，以及注入该服务的 Consumer。缺一个角色就不叫 seam。',
+    },
+    {
+      term: 'Service Definition',
+      sig: '占住 ctx.<key>，并给出类型',
+      desc: '一个 Cordis Service。可以是 ShellExecutor 这样的抽象类，也可以是 WebRuntime 这样的注册表，但不能是 TypeScript interface。',
+    },
+    {
+      term: 'Service Provider',
+      sig: '具体实现',
+      desc: '实现那个 Service Definition 的插件。换掉它，产品行为就会变——这正是 seam 存在的原因。',
+    },
+    {
+      term: 'Consumer',
+      sig: 'inject 该服务的插件',
+      desc: '通常是把能力暴露给模型的工具插件。',
+    },
+    {
+      term: '标准例子',
+      sig: 'packages/shell',
+      desc: 'dsh-shell（定义）、dsh-bash-local / dsh-bash-sandbox（实现）、dsh-tool-bash（消费者）。',
+    },
+  ]}
+/>
+
+<Callout variant="note" title="三个角色可以放在同一个包里">
+  角色要分开演进时，一般拆成不同包；同一件事时可以合在一起——
+  <code>dsh-user-approval</code> 就在一个包里既定义 approval seam，又给出实现。
+</Callout>
+
+## Agent 的 scope
+
+<DefList
+  items={[
+    {
+      term: 'scope',
+      sig: '按 agent 划分的注册单位',
+      desc: '工具、提示段落、变量、限制、监听器：要么全局（所有 agent 都看见），要么挂在恰好一个 scope key 上。只有这两层，没有嵌套。',
+    },
+    {
+      term: 'scope key',
+      sig: '按对象身份比较',
+      desc: '标识一个 scope 的不透明值。约定：活着的 agent 就是它自己那个 scope 的 key。',
+    },
+    {
+      term: 'agent.ctx',
+      sig: '这个 agent 自己的 context',
+      desc: '通过它注册的东西，只有这个 agent 看得见，生命周期也跟这个 agent 走。一件事实同时管可见性和寿命。',
+    },
+    {
+      term: 'scope carrier',
+      sig: 'thisArg，由 scopeTarget 构建',
+      desc: '按 scope 过滤派发时带上的 thisArg。过滤器放行：没打标签的监听器，加上主体自己的监听器。没有 key 的 carrier 只放行没打标签的监听器。',
+    },
+    {
+      term: 'scoped dispatch',
+      sig: '派发规则',
+      desc: '关于某个 agent 活动的事件，用那个 agent 的 carrier 派发。关于注册表自己的事件（「刚加了一个工具」）不过滤。',
+    },
+    {
+      term: 'shadowing',
+      sig: '同名时，更具体的覆盖更一般的',
+      desc: '某个 scope 上的工具、提示段落或变量，只在这个 scope 里覆盖同名的全局项。按 agent 定制 persona 或工具变体，靠的就是它。',
+    },
+    {
+      term: 'restriction',
+      sig: 'tools.restrict',
+      desc: '为单个 scope 过滤全局工具集合，多个 restriction 取交集。scope 自己注册的工具在过滤之后再合并进来。',
+    },
+    {
+      term: 'setup window',
+      sig: 'CreateAgentOptions.setup',
+      desc: '创建 agent 时的注册窗口：scope 和 agent 对象已经有了，但还没对外发布，agent/session-start 还没触发，第一次提示也还没装配。这里只注册，不驱动 agent。',
+    },
+    {
+      term: 'lineage',
+      sig: 'parentSession · delegationDepth · subagentDepth',
+      desc: '用数据记下的父子关系。它不影响谁能看见哪些工具或监听器。',
+    },
+  ]}
+/>
+
+<Callout variant="trap" title="scope 不会传给子 agent">
+  挂在某个 scope 上的注册<strong>不会</strong>传给 subagent。子树行为用 <strong>lineage 数据</strong>表达，
+  <strong>不用</strong> scope 嵌套。
+</Callout>
+
+<Callout variant="warn" title="被过滤掉的工具，看起来就像不存在">
+  被 restriction 滤掉的全局工具，<strong>提示里没有，执行也会拒绝</strong>。
+  这样模型才不会去试它根本拿不到的能力。
+</Callout>
+
+## 目标
+
+<DefList
+  items={[
+    {
+      term: 'goal',
+      sig: 'active / paused / blocked / complete',
+      desc: '挂在现有会话上的一个持久目标，带修订号、阶段和 Goal Round 上限。blocked 会留下策略代码和说明。goal 是状态，不是调度器，也不是另一段对话——对错以会话日志为准。',
+    },
+    {
+      term: 'Goal Round',
+      sig: '目标驱动的一次 turn',
+      desc: '同会话的驱动器把一个 Goal Round 落成一次由目标触发的 turn，里面可以有零个或多个 step。同一会话里普通的人类 turn 不占这个上限。',
+    },
+    {
+      term: 'goal activation',
+      sig: 'armed / disarmed',
+      desc: '进程里的开关：续跑方能不能再开一个 Goal Round。它不写入可回放的日志。',
+    },
+  ]}
+/>
+
+<Callout variant="key" title="activation 不随会话一起恢复">
+  resume 或 fork 之后，必须再通过 <code>/goal</code> 或模型工具做一次
+  <strong>人类授权的恢复</strong>，自动续跑才会开始。
+</Callout>
+
+## Ralph
+
+<DefList
+  items={[
+    {
+      term: 'Ralph loop',
+      sig: '前台、每次换全新 agent 的 workflow',
+      desc: '对着一个不可变目标跑。它是 workflow + subagent 拼出来的工具策略，不是同会话的 goal，也不是 agent-loop 的一种模式。',
+    },
+    {
+      term: 'Ralph Round',
+      sig: '一个全新子会话',
+      desc: '子会话不继承父会话或上一轮子会话的对话。跨 Round 只靠共享工作区，外加一份有上限的交接报告。',
+    },
+    {
+      term: 'Ralph handoff',
+      sig: 'status · summary · evidence · next steps · blocker',
+      desc: '这一轮交给下一轮的结构化短报告。它补充工作区，并不取代工作区。',
+    },
+  ]}
+/>
+
+## 人类命令
+
+<DefList
+  items={[
+    {
+      term: '人类命令',
+      sig: 'ctx.commands',
+      desc: '斜杠开头的指令，由给人用的适配器执行，不会变成模型消息。它不是模型工具，也不是 ctx.shell 里的 shell 命令。',
+    },
+    {
+      term: '命令通路',
+      sig: 'UI 适配器 + 命令插件',
+      desc: '负责发现、解析、执行、取消，以及把结果画出来。除非命令自己改了持久数据，输出只是 UI 状态。',
+    },
+    {
+      term: '/goal',
+      sig: 'dsh-command-goal',
+      desc: '直接查看或改当前 goal。持久且模型可见的记录仍然记在会话日志里。',
+    },
+  ]}
+/>
+
+## 组合与启动
+
+<DefList
+  items={[
+    {
+      term: 'profile',
+      sig: '命名的组合入口',
+      desc: '随产品发布的插件树入口。受支持的应用形态只有「dsh 加一个 profile」这一种。',
+    },
+    {
+      term: 'bundle',
+      sig: '可安装的 patch 层',
+      desc: '打包分发的一组 patch，叠在 profile 之上。',
+    },
+    {
+      term: 'patch',
+      sig: 'cordis.patch.yml',
+      desc: '按顺序叠加在 profile 之上的配置层。自定义组合 = 一个 profile + 若干有序 patch 文件，而不是另一个可执行文件。',
+    },
+    {
+      term: 'preset',
+      sig: 'preset cordis.yml',
+      desc: '按会话进行的 agent 组合。',
+    },
+    {
+      term: 'Harness home',
+      sig: '默认 ~/.dsh',
+      desc: '用户级配置与数据目录。Python SDK 从不静默读取它——每次启动都要求显式选择。',
+    },
+  ]}
+/>
+
+## Cordis 词汇
+
+<DefList
+  items={[
+    {
+      term: 'Context',
+      sig: 'ctx',
+      desc: '服务仓库。每个服务在 ctx 上占一个 key，并通过声明合并把类型贴上去。',
+    },
+    {
+      term: 'inject',
+      sig: '依赖模型',
+      desc: '一个插件声明它需要哪些服务；服务齐备时插件才被应用，服务消失时它被回收。',
+    },
+    {
+      term: 'effect',
+      sig: 'ctx.effect() / ctx.on()',
+      desc: '可撤销的注册。每一项贡献都要走 effect，注册表的 register() 返回 disposer——这是 HMR 与 per-agent 作用域成立的前提。',
+    },
+    {
+      term: 'fiber',
+      sig: '插件实例的运行单位',
+      desc: 'dispose 一个 fiber 会撤销它贡献的一切。每个注册表都有一个 HMR 安全测试来断言这件事。',
+    },
+    {
+      term: 'emit',
+      sig: 'ctx.emit',
+      desc: '同步广播。监听器按注册顺序观察，返回值被忽略，也不等待 Promise。session/event、tools/result 用这种模式。对照五种模式见第 02 章。',
+    },
+    {
+      term: 'waterfall',
+      sig: '必须调用 next()',
+      desc: 'around-middleware：监听器拿到 next()，调用它才把控制权交给下一个人；不调用就是短路。agent/pre-step、tools/*、llm/stream 用这种模式。',
+    },
+    {
+      term: 'parallel',
+      sig: 'await ctx.parallel',
+      desc: '所有监听器并发跑完，调用方 await 全部，没有否决、不收集返回值。session/flush 用这种模式。',
+    },
+    {
+      term: 'serial',
+      sig: 'await ctx.serial',
+      desc: '按注册顺序 await；第一个不是 null / false / undefined 的返回值停止后续。没有 next()。agent/turn-stopping 用这种模式。',
+    },
+    {
+      term: 'bail',
+      sig: 'ctx.bail',
+      desc: 'serial 的同步版：第一个有效返回值胜出。slash/input-* 用这种模式抢输入机。',
+    },
+    {
+      term: 'loader / !!js',
+      sig: 'cordis.yml',
+      desc: 'cordis.yml 只在插件 config 与条目 disabled 下允许 !!js（不是 !js）；其他元数据保持字面值，所以条件组合也要用 overlay。',
+    },
+  ]}
+/>
+
+## 会话与日志
+
+<DefList
+  items={[
+    {
+      term: 'SessionEvent',
+      sig: '仅追加日志的条目',
+      desc: '会话是一条仅追加的 SessionEvent 日志。模型消息历史从不单独存储。',
+    },
+    {
+      term: 'surface',
+      sig: '用来算出消息历史的唯一来源',
+      desc: '带 surfaceOp 的事件会进入消息历史；仅日志事件（如 compaction/*、hook/*）不进入。',
+    },
+    {
+      term: 'deriveMessages()',
+      sig: '从日志算出消息',
+      desc: '从日志算出模型消息历史。fork、resume、转录、遥测和持久化都从这条日志来。',
+    },
+    {
+      term: 'SESSION_FORMAT_VERSION',
+      sig: '固定为 0',
+      desc: '发布前不提供兼容承诺。只有结构性格式变更才会 bump 它。',
+    },
+    {
+      term: '模型可见 ⟺ 已记录',
+      sig: '规则',
+      desc: '任何进到模型请求里的东西，都必须能从会话日志重建。新增一种模型看得见的输入，就要加一种会话事件。',
+    },
+  ]}
+/>
+
+## 执行与沙箱
+
+<DefList
+  items={[
+    {
+      term: 'request / spec 分离',
+      sig: 'resolve(request): Spec',
+      desc: '填默认值是实现方自己的一步 resolve，不是藏在 run() 里的 ?? default。模板是 dsh-shell。',
+    },
+    {
+      term: 'sandbox mode',
+      sig: 'read-only / workspace-write / danger-full-access',
+      desc: '进程沙箱的三档模式。',
+    },
+    {
+      term: 'enforcement',
+      sig: 'full / partial',
+      desc: '当前平台能提供的强制力等级。',
+    },
+    {
+      term: 'ConfinedArgv',
+      sig: '两类 stderr 分类器',
+      desc: 'runnerFailureRules 与 denialSignatures：区分「沙箱本身启动失败」与「沙箱拒绝了这次访问」。',
+    },
+    {
+      term: 'read-before-edit',
+      sig: '观察策略',
+      desc: '文件编辑要求先观察过目标，防止盲写。',
+    },
+  ]}
+/>
+
+## 命名与包约定
+
+<DefList
+  items={[
+    {
+      term: '包名',
+      sig: '@deepseek-ai/dsh-<name>',
+      desc: '每一个 npm 包都遵循这个格式；vendored 包被重新 scope 并标记 private: true。',
+    },
+    {
+      term: 'peerDependency',
+      sig: '@deepseek-ai/cordis',
+      desc: '它是每一个 harness 包的 peerDependency（外加 dev 依赖）。',
+    },
+    {
+      term: 'Branded<B>',
+      sig: 'dsh-brand',
+      desc: '跨边界的不透明 id 一律用 Branded 类型，不用普通 string。',
+    },
+    {
+      term: 'assertNever',
+      sig: '闭合联合的收尾',
+      desc: '在判别式 tag 上 switch。闭合联合以 assertNever 收尾；可合并扩展的联合走一个有文档的 default。',
+    },
+    {
+      term: '源码面 / 产物面',
+      sig: 'src ↔ lib/',
+      desc: '静态门禁与测试通过 tsconfig paths 解析到 src；消费构建好的 lib/ 的门禁必须显式声明这个依赖。两者不能混用。',
+    },
+  ]}
+/>
+
+<Callout variant="key" title="写下 contract 之前，先问有没有更准的词">
+  优先写「响应字段」「JSON 校验」「ESM 导出」，不要写「响应 shape」「校验边界」「模块 shape」。
+  <strong><code>contract</code> 只用来写前置条件、后置条件、不变量、兼容承诺</strong>——也就是调用方和实现方真正要遵守的义务。
+  <strong>boundary 只用来写字面意义上的进程、协议、安全、事务或生命周期分界。</strong>
+</Callout>

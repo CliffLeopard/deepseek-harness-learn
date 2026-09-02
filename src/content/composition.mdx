@@ -1,0 +1,350 @@
+## Profile 与 Bundle 的分工
+
+一个运行中的 `dsh` 是**启动时由若干有序层组合出的插件树**。这句话里的每个词都重要：不是一个固定的应用，也不是一份静态配置，而是「有序层的叠加结果」。
+
+<Split>
+  <Panel title="Profile：一个命名的组合" tone="accent">
+    存放在 Harness home 里。它做三件事：
+
+    - 列出它要叠加的 bundle（**有序**）
+    - 容纳它安装的树外插件
+    - 保存用户自己的 `cordis.patch.yml`
+
+    `web`、`headless`、`sdk`、`sdk-minimal`、`acp` 作为模板随产品发布。
+  </Panel>
+  <Panel title="Bundle：配置行的分发格式" tone="violet">
+    它分发的是 **Cordis 配置行 + 这些行要挂载的代码**。
+
+    关键性质：bundle 插入的内容<strong>仍然可以被它上面的层 patch</strong>。这就是为什么 bundle 不是「黑盒依赖」。
+  </Panel>
+</Split>
+
+两者都在自己的 `package.json` 里用 `dsh` 字段声明身份：
+
+```json
+{
+  "name": "@deepseek-ai/dsh-web-app",
+  "dsh": {
+    "bundle": "cordis.patch.yml"
+  }
+}
+```
+
+<DataTable
+  head={['package.json 字段', '含义']}
+  rows={[
+    ['dsh.profile', '列出这个 profile 叠加的 bundle 序列'],
+    ['dsh.bundle', '指向这个 bundle 的 patch 文件'],
+  ]}
+/>
+
+## 分层应用顺序
+
+这是本章的核心事实。层从**空条目列表**开始，按下面的顺序依次应用：
+
+<Figure
+  kind="架构图"
+  title="patch 层的应用顺序：后面的层可以覆盖前面的层"
+  caption={
+    <>
+      一个 patch <strong>按 id 定位一行</strong>，然后替换它的整个 config，或者插入新行。因此越靠上的层权力越大，而最上面的 <code>--patch</code> 只是一次性的覆盖层。
+    </>
+  }
+>
+  <Layers
+    rows={[
+      {
+        title: '4. --patch 覆盖层',
+        meta: '命令行传入',
+        tone: 'rose',
+        chips: [{ title: '一次性覆盖' }, { title: '可多个，按给出顺序' }],
+        note: '权力最大，最后应用。适合临时实验与自动化调用方。',
+      },
+      {
+        title: '3. home 级 cordis.patch.yml',
+        meta: 'Harness home 根',
+        tone: 'amber',
+        chips: [{ title: '跨 profile 生效' }],
+        note: '这台机器上所有 profile 共享的用户偏好。',
+      },
+      {
+        title: '2. profile 的 cordis.patch.yml',
+        meta: 'Harness home / profile 目录',
+        tone: 'lime',
+        chips: [{ title: '只作用于该 profile' }],
+        note: '用户对这一个 profile 的定制。',
+      },
+      {
+        title: '1. profile 列出的每个 bundle',
+        meta: '按 profile 声明的顺序',
+        tone: 'violet',
+        chips: [
+          { title: 'dsh-base', sub: '共享第一层' },
+          { title: 'dsh-web-app / dsh-headless / …', sub: '应用层' },
+        ],
+        note: '同一 profile 内，后列出的 bundle 可以 patch 先列出的 bundle 插入的行。',
+      },
+      {
+        title: '0. 空条目列表',
+        meta: '起点',
+        tone: 'neutral',
+        chips: [{ title: '没有任何隐式内核' }],
+        note: '「没有特权内核可打补丁」在这里得到字面意义上的体现。',
+      },
+    ]}
+  />
+</Figure>
+
+## 随产品发布的 bundle
+
+<Cards
+  cols={2}
+  items={[
+    {
+      title: 'dsh-base',
+      meta: 'packages/bundle/base',
+      tone: 'accent',
+      body: 'web、headless、sdk、acp 四个 profile 共享的第一层：模型适配器、工具、持久化、沙箱与审批策略、设置、凭据、遥测。',
+    },
+    {
+      title: 'dsh-web-app',
+      meta: 'packages/bundle/web-app',
+      tone: 'violet',
+      body: '在 base 之上加入浏览器应用。',
+    },
+    {
+      title: 'dsh-headless',
+      meta: 'packages/bundle/headless',
+      tone: 'lime',
+      body: '加入一次性运行器，不启动服务器。',
+    },
+    {
+      title: 'dsh-sdk-app',
+      meta: 'packages/bundle/sdk-app',
+      tone: 'amber',
+      body: '加入 SDK 的 JSON-RPC 服务端。',
+    },
+    {
+      title: 'dsh-acp-app',
+      meta: 'packages/bundle/acp-app',
+      tone: 'rose',
+      body: '加入仅自动化用途的 ACP 服务端。',
+    },
+    {
+      title: 'dsh-sdk-minimal',
+      meta: 'packages/bundle/sdk-minimal',
+      tone: 'neutral',
+      body: '故意留下的例外：由一个 bundle 独占完整、显式的 SDK 树，并且不应用 dsh-base。',
+    },
+  ]}
+/>
+
+<Callout variant="warn" title="sdk-minimal 为什么是例外">
+  它是<strong>仓库自有的独立 bundle</strong>，跑在同一个启动器后面，而不是「调用方提供的 Cordis 树」。
+  这个区分很重要：它不构成「可以绕过 profile 组装任意树」的先例。
+</Callout>
+
+## patch 实时重载：谁是活的
+
+<Figure
+  kind="对照表"
+  title="哪些 profile 支持 patch 实时重载"
+  caption={
+    <>
+      自定义 profile <strong>默认</strong>是实时重载。<code>headless</code>、<code>sdk</code>、
+      <code>sdk-minimal</code>、<code>acp</code> 之所以只在启动时应用一次，是因为在一个一次性任务或
+      stdio 应用<strong>已经拥有工作之后</strong>再替换它的依赖，会让那个生命周期失效。
+    </>
+  }
+>
+  <Matrix
+    corner="profile"
+    cols={['patch 应用时机', '原因']}
+    rows={[
+      {
+        label: 'web',
+        cells: [
+          { label: '实时（live）', tone: 'lime' },
+          { label: '长驻服务，可以安全换依赖', tone: 'neutral' },
+        ],
+      },
+      {
+        label: '自定义 profile',
+        cells: [
+          { label: '默认实时', tone: 'lime' },
+          { label: '默认值取自 web 的行为', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'headless',
+        cells: [
+          { label: '启动时一次', tone: 'amber' },
+          { label: '一次性运行器', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'sdk / sdk-minimal',
+        cells: [
+          { label: '启动时一次', tone: 'amber' },
+          { label: 'stdio 应用已持有调用方的工作', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'acp',
+        cells: [{ label: '启动时一次', tone: 'amber' }, { label: '同上', tone: 'neutral' }],
+      },
+    ]}
+  />
+</Figure>
+
+## 看清你这台机器实际启动的树
+
+不要靠猜。有一个命令直接把组合结果打印出来：
+
+```sh
+dsh --profile web --dump-config
+```
+
+<Callout variant="key">
+  它打印出来的<strong>任何一行</strong>，都可以被你自己的 patch 替换掉。这就是「不改一行源码改变产品行为」的完整含义。
+</Callout>
+
+## 启动流程
+
+<Figure
+  kind="生命周期"
+  title="从 argv 到一棵活着的插件树"
+  caption="注意第 4 步与第 5 步的顺序：条目列表先被完整地叠加出来，然后才交给 Cordis loader 挂载。patch 作用于「条目」，不是作用于「已经活着的插件」。"
+>
+  <Pipeline
+    stages={[
+      {
+        title: '解析 argv，确定 profile',
+        sub: 'apps/cli · dsh',
+        tone: 'accent',
+        body: (
+          <>
+            <code>dsh web</code> 是 <code>--profile web</code> 的官方别名；其余形态显式写 <code>--profile</code>。
+          </>
+        ),
+      },
+      {
+        title: '定位 Harness home 与 profile 目录',
+        tone: 'accent',
+        body: '找到 profile 的声明、它安装的树外插件，以及它自己的 cordis.patch.yml。',
+      },
+      {
+        title: '按声明顺序读取 bundle',
+        sub: 'dsh.profile → dsh.bundle',
+        tone: 'violet',
+        body: '每个 bundle 提供一批配置行以及这些行要挂载的代码。',
+      },
+      {
+        title: '叠加四层 patch',
+        sub: 'bundle → profile → home → --patch',
+        tone: 'lime',
+        body: '每一层按 id 替换整行 config 或插入新行，得到最终的条目列表。',
+        branches: [
+          { label: '引用不存在的 id', to: '在最早可解析处报错', tone: 'rose' },
+        ],
+      },
+      {
+        title: '交给 Cordis loader 挂载',
+        sub: '@deepseek-ai/cordis-plugin-include',
+        tone: 'amber',
+        body: (
+          <>
+            此时才求值 <code>!!js</code>：<code>config</code> 在插件自己的 context 上、
+            <code>disabled</code> 在 loader context 上。
+          </>
+        ),
+      },
+      {
+        title: '按 inject 解除阻塞，服务陆续就位',
+        tone: 'rose',
+        body: '没有手写的启动序列——顺序由服务依赖表达。',
+      },
+    ]}
+  />
+</Figure>
+
+## Harness home
+
+profile 不是散落在代码里的常量，而是 home 目录里的**数据**。这意味着同一份安装可以并存多套组合，并且用户的定制不会被升级覆盖。
+
+<Tree
+  nodes={[
+    {
+      label: '<harness home>/',
+      tone: 'accent',
+      children: [
+        {
+          label: 'cordis.patch.yml',
+          note: 'home 级 patch：所有 profile 共享',
+          tone: 'amber',
+        },
+        {
+          label: 'profiles/<name>/',
+          tone: 'violet',
+          note: '一个命名组合',
+          children: [
+            { label: 'package.json', note: 'dsh.profile 列出 bundle 顺序', tone: 'lime' },
+            { label: 'cordis.patch.yml', note: 'profile 级 patch', tone: 'amber' },
+            { label: 'node_modules/', note: '该 profile 安装的树外插件', tone: 'neutral' },
+          ],
+        },
+        { label: '.sessions/', note: '会话持久化落地位置', tone: 'neutral' },
+      ],
+    },
+  ]}
+/>
+
+<Callout variant="note" title="精确路径以实现为准">
+  上面的树是<strong>结构示意</strong>：`dsh --profile web --dump-config` 与
+  `packages/boot/app-boot/README.md#profiles` 才是依据。组合机制的字段清单在生成的 config catalog（`docs/config-catalog.md`）。
+</Callout>
+
+## 写自己的 patch
+
+patch 的两种操作只有替换与插入，没有「合并」。理解这一点能避免大量困惑。
+
+```yaml
+# my.patch.yml
+patches:
+  # 按 id 定位已有行，替换它的整个 config
+  - id: tool-bash
+    config:
+      timeoutMs: 30000
+      # 注意：这是整体替换。原来的其他字段不会被保留。
+
+  # 插入新行
+  - insert:
+      name: my-local-plugin
+      config:
+        verbose: true
+```
+
+<Callout variant="rule" title="不要在插件里硬编码可调参数">
+  会随部署变化的选择必须是经过校验的 <code>Config</code> 字段，能从 cordis.yml 改。
+  一个 <code>DEFAULT_*</code> 常量或者测试钩子<strong>不算</strong>可配置性。
+  协议常量、外部规范与安全不变量则保持固定，不应当暴露为配置。
+</Callout>
+
+<Callout variant="trap" title="默认值不是「run() 里的 ?? 兜底」">
+  包边界上要求显式优于隐式：定默认值是拥有该实现里一个显式的{' '}
+  <code>resolve(request): Spec</code> 步骤，而不是藏在 <code>run()</code> 内部的{' '}
+  <code>?? default</code>。<code>dsh-shell</code> 的 request / spec 拆分是这条规则的模板，见
+  <a href="/docs/execution">第 11 章</a>。
+</Callout>
+
+## 一个 session 想要不同的能力集合
+
+如果需求是「让某一个会话拥有和别人不同的工具集」，答案不是 patch，而是**agent preset**：
+
+```text
+packages/preset/  per-session agent composition from preset cordis.yml files
+```
+
+preset 里的一行**服务**需要 `isolate` realm——否则它会和主树上的同名服务冲突。这是 preset 与普通 patch 最容易踩的差别。
+
+下一章把这些层接到「怎么写一个插件」：三种包、最小 `apply`，以及它怎样进入一次 turn。见 [第 04 章](/docs/plugins)。

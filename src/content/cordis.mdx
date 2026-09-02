@@ -1,0 +1,435 @@
+## Cordis 的五个基本概念
+
+Cordis 只有五个概念。这五个概念搞清楚之后，`packages/` 里几乎每个文件长什么样你都能预测。
+
+<DefList
+  items={[
+    {
+      term: 'plugin',
+      sig: '实现 Service 的对象',
+      desc: (
+        <>
+          可以是一个带可选 <code>inject</code> 与 <code>apply(ctx)</code> 字段的函数，也可以是一个{' '}
+          <code>Service</code> 子类——后者的生命周期由 Cordis 挂到当前 context 上。
+        </>
+      ),
+    },
+    {
+      term: 'context',
+      sig: '服务仓库',
+      desc: (
+        <>
+          一个服务从 context 上占据稳定的 <code>ctx.&lt;key&gt;</code>，例如 <code>ctx.tools</code>、
+          <code>ctx.llm</code>、<code>ctx.sessions</code>。其他插件<strong>按 key 查找</strong>服务，而不是导入某个具体实现。
+        </>
+      ),
+    },
+    {
+      term: 'inject',
+      sig: '声明式依赖',
+      desc: '插件声明它需要的服务名后，会一直等到这些服务存在才激活。加载顺序由服务需求表达，而不是手写启动序列。',
+    },
+    {
+      term: 'typed events',
+      sig: 'declaration merging',
+      desc: '服务用 TypeScript 声明合并声明事件名，再按 emit / waterfall / parallel / serial / bail 之一派发。',
+    },
+    {
+      term: 'effect',
+      sig: '可撤销注册',
+      desc: (
+        <>
+          提示段落、工具 schema、适配器、provider、监听器都通过 <code>ctx.effect()</code> 或{' '}
+          <code>ctx.on()</code> 安装，因此重载与拆卸能按预期把它们逐一撤销。
+        </>
+      ),
+    },
+  ]}
+/>
+
+<Callout variant="rule" title="每个注册都要有 disposer">
+  要么从 <code>ctx.effect()</code> 返回一个，要么用替你做这件事的 Cordis 辅助函数。
+  如果拆卸顺序有意义，就把相关工作放进<strong>同一个</strong> effect，让撤销按预期顺序展开。
+</Callout>
+
+## 两种插件写法
+
+这两种形态只解决「模块怎么被 Cordis 挂上」。写完之后怎样进产品、怎样进入一次 turn，见 [第 04 章](/docs/plugins)。
+
+<Split>
+  <Panel title="函数式插件" tone="accent">
+    最常见的形态。适合只贡献 effect、不需要暴露服务的插件。
+
+```ts
+import type { Context } from '@deepseek-ai/cordis'
+
+export const inject = ['tools', 'llm']
+
+export function apply(ctx: Context) {
+  // 每个贡献都是一个 effect：卸载时自动撤销。
+  const dispose = ctx.tools.register(myTool)
+  ctx.effect(() => dispose)
+}
+```
+
+  </Panel>
+  <Panel title="Service 子类" tone="violet">
+    当插件本身要占据 ctx 上某个服务键时使用。Cordis 负责它的生命周期。
+
+```ts
+import { Service } from '@deepseek-ai/cordis'
+
+export class MyRegistry extends Service {
+  static inject = ['sessions']
+
+  constructor(ctx: Context) {
+    // 第二个参数就是它占据的服务键：ctx.myRegistry
+    super(ctx, 'myRegistry')
+  }
+}
+```
+
+  </Panel>
+</Split>
+
+## 事件派发模式
+
+插件之间不互相 import，靠事件通信。事件名用 TypeScript 声明合并写进 `interface Events`，**派发模式是这条事件公开契约的一部分**：它决定监听器能不能返回值、会不会被 await、能不能改写结果、能不能让后面的人不再跑。
+
+五种模式对应五个派发方法。监听一律 `ctx.on(name, handler)`；发出去的时候必须用对上的那个方法——`emit` 事件不能拿去 `waterfall`。新增 harness 事件要在 JSDoc 里写 `@mode`，生成目录会核对声明和实际派发点。
+
+<Callout variant="key">
+  先问「监听器是观察、改写、并发收尾，还是抢一个答案」。选错模式，后面的人要么改不了结果，要么默默把整条链吃掉。
+</Callout>
+
+<DataTable
+  head={['模式', '派发', '是否 await 监听器', '顺序', '返回值']}
+  rows={[
+    ['emit', 'ctx.emit', '否', '按注册顺序同步跑', '忽略'],
+    ['waterfall', 'ctx.waterfall', '否（调用方常 await 返回的 Promise）', '按注册顺序，around 包装', '有；经 next() 向上传'],
+    ['parallel', 'await ctx.parallel', '是，并发', '同时跑完', '无'],
+    ['serial', 'await ctx.serial', '是，按顺序', '按注册顺序；第一个有效返回值停止后续', '有'],
+    ['bail', 'ctx.bail', '否', 'serial 的同步版', '有'],
+  ]}
+/>
+
+<Callout variant="warn" title="Cordis 事件不是会话日志里的 type">
+  <code>turn/start</code>、<code>tool/call</code> 是 <code>SessionEvent</code> 的判别字段，写进只追加的日志。
+  对应的 Cordis 广播是 <code>session/event</code>（emit）。要观察一次 turn 的开闭，听{' '}
+  <code>session/event</code> 再看 <code>event.type</code>，不要去 <code>ctx.emit('turn/start')</code>。
+</Callout>
+
+### 怎么选
+
+<Figure
+  kind="对照表"
+  title="选哪个派发模式"
+  caption="观察用 emit，包装用 waterfall，扇出用 parallel，顺序求值用 serial，抢答用 bail。"
+>
+  <Matrix
+    corner="我想要"
+    cols={['模式', '典型场景']}
+    rows={[
+      {
+        label: '只是被通知',
+        cells: [{ label: 'emit', tone: 'accent' }, { label: 'session/event · tools/result · agent/error', tone: 'neutral' }],
+      },
+      {
+        label: '包装并可改写结果',
+        cells: [
+          { label: 'waterfall', tone: 'violet' },
+          { label: 'agent/pre-step · tools/* · llm/stream · system-prompt/assemble', tone: 'neutral' },
+        ],
+      },
+      {
+        label: '所有副作用都必须做完',
+        cells: [{ label: 'parallel', tone: 'lime' }, { label: 'session/flush 持久化检查点', tone: 'neutral' }],
+      },
+      {
+        label: '按顺序 await，可提前结束',
+        cells: [
+          { label: 'serial', tone: 'amber' },
+          { label: 'agent/turn-stopping 终止检查点', tone: 'neutral' },
+        ],
+      },
+      {
+        label: '第一个有主张的人说了算',
+        cells: [{ label: 'bail', tone: 'rose' }, { label: 'slash/input-* 抢输入机', tone: 'neutral' }],
+      },
+    ]}
+  />
+</Figure>
+
+### emit：广播，只观察
+
+`ctx.emit(name, ...args)` 按注册顺序**同步**调用监听器，不等待它们返回的 Promise，也不收集返回值。适合「这件事已经发生了，告诉大家」。
+
+**使用场景**
+
+- 事实已经冻结，监听器改不了结果：`session/event`、`tools/result`、`agent/error`、`agent/status`、`tools/change`。
+- UI、转录、遥测、日志插件。不要在 emit 里做「允许 / 拒绝」——没有返回值通道，也没有短路。
+
+```ts
+ctx.on('tools/result', (exec, result) => {
+  console.log(`${exec.name} -> ${result.isError ? 'error' : 'ok'}`)
+})
+```
+
+异步监听器里的失败会被吞掉或另行记录，**不能**拦下后续监听器。需要「所有人都做完才继续」时用 parallel。
+
+### waterfall：包装或短路
+
+`ctx.waterfall` 是 **around-middleware**，不是「按顺序通知一圈」。每个监听器拿到 `(...args, next)`：调用 `next()` 把控制权交给下一个人（以及最后传入的默认实现）；**不调用 `next()` 就返回，等于否决整条链**。返回值沿 `next()` 向上传，所以外层可以包装内层的结果。
+
+这是 harness 里**策略与改写**最常用的模式：`agent/pre-step`、`agent/request`、`agent/request-error`、`llm/stream`、`system-prompt/assemble`、`tools/pre-execute` / `execute` / `post-execute`、`approval/request`。
+
+<Callout variant="trap" title="只观察的人忘记 next()，会静默吃掉下游">
+  日志、指标这类监听器<strong>必须</strong> <code>return next()</code>。只有真正拥有该决策的策略才能不调用 next() 直接返回。
+</Callout>
+
+<Figure
+  kind="生命周期"
+  title="waterfall 的委托与短路"
+  caption={
+    <>
+      协作型监听器通常改共享的 request / decision，再委托。也可以整体换掉结果，下游只看见换过的值。
+      只有必须跑在普通注册之前时才用 <code>prepend: true</code>。
+    </>
+  }
+>
+  <Sequence
+    actors={[
+      { name: '派发点', sub: 'ctx.waterfall(...)', tone: 'accent' },
+      { name: '监听器 A', sub: '观察/标注', tone: 'lime' },
+      { name: '监听器 B', sub: '策略决策', tone: 'amber' },
+      { name: '默认实现', sub: '链尾', tone: 'violet' },
+    ]}
+    steps={[
+      { type: 'phase', label: '协作路径' },
+      { type: 'msg', from: '派发点', to: '监听器 A', label: '(args, next)', tone: 'accent' },
+      { type: 'self', at: '监听器 A', label: '修改共享 request', tone: 'lime' },
+      { type: 'msg', from: '监听器 A', to: '监听器 B', label: 'next()', tone: 'lime' },
+      { type: 'msg', from: '监听器 B', to: '默认实现', label: 'next()', tone: 'amber' },
+      { type: 'msg', from: '默认实现', to: '监听器 B', label: 'result', style: 'return', tone: 'violet' },
+      { type: 'msg', from: '监听器 B', to: '派发点', label: '(可包装后)返回', style: 'return', tone: 'violet' },
+      { type: 'phase', label: '短路路径' },
+      { type: 'msg', from: '派发点', to: '监听器 B', label: '(args, next)', tone: 'accent' },
+      { type: 'self', at: '监听器 B', label: '我拥有这个决策', tone: 'rose' },
+      { type: 'msg', from: '监听器 B', to: '派发点', label: '不调用 next() 直接返回', style: 'return', tone: 'rose' },
+      { type: 'note', label: '默认实现与其后的监听器都不会运行——对单一决策事件而言，这正是设计意图。' },
+    ]}
+  />
+</Figure>
+
+```ts
+ctx.on('tools/pre-execute', async (exec, next) => {
+  if (!(await isAllowed(exec))) {
+    return { kind: 'deny', reason: 'Denied by policy.' }
+  }
+  return next()
+})
+
+declare function isAllowed(exec: unknown): Promise<boolean>
+```
+
+派发方法本身不像 parallel/serial 那样替你 await 每个监听器；链的返回值常常是 Promise，由调用方 await。写新事件时最后一个参数是默认实现（链尾的 `next`）。
+
+### parallel：并发做完，没有否决
+
+`await ctx.parallel(name, ...args)` 让**所有**监听器同时跑，并等它们全部结束。没有返回值通道，也没有人能否决别人。
+
+**使用场景**：一件事必须落到每一处之后，调用方才能继续。仓库里的例子是 `session/flush`——缓冲里的事件要进持久存储，每个监听器都是一个耐久检查点，不能像 waterfall 那样被短路。
+
+不要用 parallel 做策略。策略需要返回值或 `next()`，那是 waterfall / serial / bail。
+
+### serial：顺序 await，可提前结束
+
+`await ctx.serial(name, ...args)` 按注册顺序跑，并等待每个监听器（含 async）。**第一个不是 `null` / `false` / `undefined` 的返回值成为结果，后面的人不再跑。** 没有 `next()`。
+
+**使用场景**
+
+- 需要「一个接一个做完，而且可以提前给出答案」的阶段。
+- harness 里的 `agent/turn-stopping`：turn 即将关闭时按顺序 await 监听器。这里的处理函数返回 `void`，异议的方式是调用 `agent.steer(...)`，机器再读 inbox——**数据决定要不要再跑一个 step，所以监听器顺序改变不了结果**。不要把它写成 waterfall，它没有 `next()`。
+
+和 waterfall 的差别：serial 不能包装下游返回值；它要么弃权（返回空），要么给出一个值并停掉后面的人。
+
+### bail：第一个有效答案
+
+`ctx.bail(name, ...args)` 是 serial 的**同步**版：按注册顺序跑，第一个不是 `null` / `false` / `undefined` 的返回值胜出并停止后续。派发方法本身不等待 Promise。
+
+**使用场景**：同一时刻只能有一个人认领的同步决策。Web Client 输入机上的 `slash/input-begin-command`、`slash/input-insert-reference`、`slash/input-consume-token`、`slash/input-insert-text` 都是 bail——某个插件返回 `true` 表示已经处理了这个 token，别人不必再动。
+
+需要 await 或允许异步认领时，用 serial，不要用 bail。
+
+### 声明一次，模式就钉死
+
+```ts
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /** @mode emit */
+    'stats/report'(name: string, count: number): void
+    /** @mode waterfall */
+    'demo/transform'(input: string, next: () => Promise<string>): Promise<string>
+  }
+}
+```
+
+`ctx.on` 与 `ctx.emit` / `ctx.waterfall` / … 都会按这份签名推断。`import type {} from '@deepseek-ai/dsh-tools'` 这类副作用导入，是为了让当前文件看见别的包合并进来的事件。
+
+循环里各扩展点挂了哪种模式，见 [第 06 章](/docs/lifecycle)；工具管线三段 waterfall 见 [第 08 章](/docs/tools)。
+
+## 插件生命周期
+
+<Figure
+  kind="生命周期"
+  title="从挂载到卸载：effect 如何被撤销"
+  caption="重载一个插件 = 撤销它的所有 effect，再重新 apply。因为撤销是逐条 effect 的，所以不需要全局重启。"
+>
+  <Timeline
+    items={[
+      {
+        at: 'mount',
+        title: '插件被放入 context',
+        body: '如果声明了 inject，则进入等待，直到所有被点名的服务存在。',
+        tone: 'neutral',
+      },
+      {
+        at: 'apply(ctx)',
+        title: '注册贡献',
+        body: (
+          <>
+            通过 <code>ctx.effect()</code> / <code>ctx.on()</code> 安装服务、监听器、提示段落、工具
+            schema、适配器。
+          </>
+        ),
+        tone: 'accent',
+      },
+      {
+        at: 'active',
+        title: '服务可被按 key 发现',
+        body: '此时它占据的服务键对其他插件可见，等待它的插件被解除阻塞。',
+        tone: 'lime',
+      },
+      {
+        at: 'dispose',
+        title: '按相反顺序撤销 effect',
+        body: '注册表的 register() 返回的 disposer 在这里被调用，工具与提示段落随之消失。',
+        tone: 'amber',
+      },
+      {
+        at: 'unmount',
+        title: '依赖它的插件回到等待状态',
+        body: '不是崩溃，而是回到「等待服务出现」的状态——这就是 patch 实时重载可行的原因。',
+        tone: 'rose',
+      },
+    ]}
+  />
+</Figure>
+
+## Loader 与配置解释
+
+`cordis.yml` 不是普通的静态配置：它有一个明确的求值模型，而这个模型的边界经常被误解。
+
+<Pipeline
+  stages={[
+    {
+      title: 'Include 插件解析 !!js',
+      sub: '@deepseek-ai/cordis-plugin-include',
+      tone: 'accent',
+      body: (
+        <>
+          把 <code>!!js</code> 解析成表达式节点。注意只有 <code>!!js</code>（两个感叹号），
+          <code>!js</code> 不是合法写法。
+        </>
+      ),
+    },
+    {
+      title: '插值 config',
+      sub: '在声明的 injection 激活之后',
+      tone: 'violet',
+      body: (
+        <>
+          针对<strong>该插件自己的 context</strong> 求值（也就是 <code>ctx.serviceName</code> 可用）。
+        </>
+      ),
+    },
+    {
+      title: '插值 disabled',
+      sub: '在每一次挂载决策时',
+      tone: 'lime',
+      body: <>针对 <strong>loader 的 context</strong> 求值，因此每次决定要不要挂载都会重新算一遍。</>,
+    },
+    {
+      title: '嵌套行保持未求值',
+      sub: 'Include 的行为',
+      tone: 'amber',
+      body: 'Include 会保留嵌套行里的表达式，直到目标激活时才求值。',
+    },
+    {
+      title: '其他元数据保持字面量',
+      tone: 'rose',
+      body: '除 config 与 disabled 外的条目元数据不做插值。环境决定挂哪些插件时，用 overlay，而不是表达式。',
+    },
+  ]}
+/>
+
+```yaml
+# cordis.yml：只有 plugin config 与 entry disabled 支持 !!js
+plugins:
+  - id: my-row
+    name: dsh-tool-bash
+    # config 在这个插件自己的 context 上求值
+    config:
+      timeoutMs: !!js ctx.settings.get('bash.timeoutMs') ?? 120000
+    # disabled 在 loader context 上求值，每次挂载决策都会重算
+    disabled: !!js process.platform === 'win32'
+```
+
+<Callout variant="warn" title="条件组合用 overlay，不用表达式">
+  因为除 <code>config</code> 与 <code>disabled</code> 之外的元数据都是字面量，
+  「环境决定挂载哪些插件」这类需求应该通过 overlay（也就是 patch 分层）表达。见<a href="/docs/composition">第 03 章</a>。
+</Callout>
+
+## 实践规则
+
+<Cards
+  cols={2}
+  items={[
+    {
+      title: '把行为封装进插件',
+      tone: 'accent',
+      body: (
+        <>
+          工具管线事件属于 <code>ctx.tools</code>，模型流式属于 <code>ctx.llm</code>，
+          活的 agent 协调属于 <code>ctx.agents</code>。事件放错服务，就等于把耦合写进了架构。
+        </>
+      ),
+    },
+    {
+      title: '拦截与策略用事件，直接调用能力用方法',
+      tone: 'violet',
+      body: '这是判断「该加一个事件还是加一个方法」的标准：你是在插入策略，还是在请求一次能力执行？',
+    },
+    {
+      title: '注册表 register() 返回 disposer',
+      tone: 'lime',
+      body: '这是仓库层面的约定，不是 Cordis 的强制要求。看到一个 register() 返回 void，就说明它写错了。',
+    },
+    {
+      title: '类型化事件用声明合并',
+      tone: 'amber',
+      body: (
+        <>
+          事件 JSDoc 需要 <code>@mode</code> 与载荷的 <code>@param</code>；载荷里没有的 scoped key
+          需要标 <code>@dshScopeScan unsupported</code>。
+        </>
+      ),
+    },
+  ]}
+/>
+
+## vendoring 政策
+
+`vendor/` 下的包是**固定的源码副本**，不是依赖。清单与上游 SHA 在 `vendor/README.md`。更新流程也在那里；更新后需要重新施加或退役已记录的本地修改，并重跑 `pnpm run test && pnpm run build`。
+
+`@deepseek-ai/cosmokit` 与 `@deepseek-ai/schemastery` 通过 `pnpm-workspace.yaml` 的 `overrides` 指向 `link:vendor/...`，这样本地构建一定解析到工作区里被固定的那份源码。

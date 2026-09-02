@@ -1,0 +1,307 @@
+## 三个词，不能混用
+
+<DefList
+  items={[
+    {
+      term: 'step',
+      sig: '一次模型请求 + 它引发的工具调用',
+      desc: '循环的最小推进单位。一个 step 内可能并发执行多个工具，但只有一次模型请求。',
+    },
+    {
+      term: 'turn',
+      sig: '零个或多个 step',
+      desc: '在它的第一份输入被 claim 之前开启，在「不再欠任何工作」时关闭。零 step 的 turn 是合法且有意义的。',
+    },
+    {
+      term: 'round',
+      sig: '包住 turn 的外层策略迭代',
+      desc: 'goal round 属于目标管理层，不属于循环本身。一个 round 可以驱动多个 turn。',
+    },
+  ]}
+/>
+
+<Callout variant="trap" title="最常见的三个误解">
+  **「一次对话就是一个 turn」**——不对。一个 turn 里可能有十几个 step。
+
+  **「没有模型请求就没有 turn」**——不对。被拒绝的输入仍然会开启并关闭一个**不花费任何 step** 的持久 turn，好让日志记录下这次尝试。
+
+  **「round 是 turn 的同义词」**——不对。round 是目标层的迭代，见 [第 12 章](/docs/orchestration)。
+</Callout>
+
+## turn 流程的文字提纲
+
+这是 `docs/architecture.md` 里的提纲。先读它，再读下面的时序图。
+
+```text
+turn/start
+  claim next-step input plus one queued message
+  assemble prompt sections + tool schemas
+  -> agent/pre-step                   reject | enter(messages, startsRequestSeries?)
+     reject, or a first enter rewritten empty -> close the turn with no step
+     step/start
+     append entered messages as user/message
+     derive model history from the log
+     agent/request -> llm/stream -> assistant/chunk* -> assistant/message
+     tool/call* -> tools/pre-execute -> tools/execute -> tools/post-execute -> tool/result*
+     step/end
+     tools owe another request, or next-step input arrived -> claim -> next step
+  -> agent/turn-stopping
+turn/end
+```
+
+## 哪些是持久事件，哪些是活的扩展点
+
+这个区分决定了你的监听器在重载后还在不在。
+
+<DataTable
+  head={['名字', '类别', '派发模式', '说明']}
+  rows={[
+    ['turn/start · turn/end', '会话事件', 'emit（广播）', 'turn 的开闭，追加到日志'],
+    ['step/start · step/end', '会话事件', 'emit（广播）', 'step 的开闭'],
+    ['user/message', '会话事件', 'emit（广播）', 'enter 决策通过后的输入被写入'],
+    ['assistant/chunk · assistant/message', '会话事件', 'emit（广播）', 'chunk 保留回放与 UI 保真度'],
+    ['tool/call · tool/result', '会话事件', 'emit（广播）', '执行前先记录 call'],
+    ['agent/pre-step', 'Agent 事件', 'waterfall', '决定模型看到什么'],
+    ['agent/request', 'Agent 事件', 'waterfall', '构造请求'],
+    ['llm/stream', '能力事件', 'waterfall', '适配器 seam 的派发点'],
+    ['tools/pre-execute · tools/execute · tools/post-execute', '能力事件', 'waterfall', '工具管线三段'],
+    ['agent/request-error', 'Agent 事件', 'waterfall', '返回重试动作，或保留原始错误'],
+    ['agent/turn-stopping', 'Agent 事件', 'serial', '终止检查点，没有 next()'],
+    ['agent/status', 'Agent 事件', 'emit', 'running / idle'],
+    ['agent/inbox/*', 'Agent 事件', 'emit', 'spliced / inserted / claimed'],
+  ]}
+/>
+
+<Callout variant="warn" title="waterfall 必须调用 next()">
+  <code>agent/pre-step</code>、<code>agent/request</code>、<code>llm/stream</code> 与三个{' '}
+  <code>tools/*</code> 都是 waterfall，监听器<strong>必须调用 next()</strong> 才能把控制权委托下去。
+  <code>agent/turn-stopping</code> 是 serial，它<strong>没有</strong> next()。五种模式的对照见
+  <a href="/docs/cordis#事件派发模式">第 02 章</a>。
+</Callout>
+
+## 完整时序：一个 turn 里发生的一切
+
+<Figure
+  kind="时序图"
+  scroll
+  title="从用户输入到 turn/end：持久事实走 session/event，活的控制走 agent/*"
+  caption={
+    <>
+      这张图的结构对应 <code>docs/agent-lifecycle.md</code> 里生成的 Mermaid 时序图。两条最关键的分岔是：
+      <strong>pre-step 拒绝</strong>（turn 开了但不花 step）与<strong>请求失败</strong>（step 先关，再走 request-error 恢复）。
+    </>
+  }
+>
+  <Sequence
+    actors={[
+      { name: 'User', tone: 'neutral' },
+      { name: 'Agent', sub: 'ctx.agents', tone: 'accent' },
+      { name: 'Driver', sub: 'ctx.agentLoop', tone: 'accent' },
+      { name: 'Hooks', sub: 'agent/* 监听器', tone: 'amber' },
+      { name: 'Prompt', sub: 'ctx.systemPrompt', tone: 'lime' },
+      { name: 'LLM', sub: 'ctx.llm', tone: 'violet' },
+      { name: 'Tools', sub: 'ctx.tools', tone: 'rose' },
+      { name: 'Session', sub: 'ctx.sessions', tone: 'accent' },
+    ]}
+    steps={[
+      { type: 'phase', label: '入队与唤醒' },
+      { type: 'msg', from: 'User', to: 'Agent', label: 'followup(content)', tone: 'neutral' },
+      { type: 'msg', from: 'Agent', to: 'Session', label: 'agent/inbox/spliced', style: 'async', tone: 'accent' },
+      { type: 'msg', from: 'Agent', to: 'Session', label: 'agent/inbox/inserted', style: 'async', tone: 'accent' },
+      { type: 'msg', from: 'Agent', to: 'Driver', label: '队列中的工作唤醒 driver', tone: 'accent' },
+      { type: 'msg', from: 'Driver', to: 'Session', label: 'agent/status running', style: 'async', tone: 'accent' },
+
+      { type: 'phase', label: 'turn 开启与 claim' },
+      { type: 'msg', from: 'Driver', to: 'Session', label: 'turn/start', tone: 'accent' },
+      { type: 'note', label: 'claim：待处理的 next-step 输入，加上一条排队的 prompt' },
+      { type: 'msg', from: 'Driver', to: 'Session', label: 'agent/inbox/claimed { message, turn }', style: 'async', tone: 'accent' },
+
+      { type: 'phase', label: 'pre-step 决策' },
+      { type: 'msg', from: 'Driver', to: 'Hooks', label: 'agent/pre-step (waterfall)', tone: 'amber' },
+      { type: 'msg', from: 'Hooks', to: 'Driver', label: 'reject | enter(messages)', style: 'return', tone: 'amber' },
+      { type: 'note', label: 'reject：claim 掉的批次保持被移除，已开启的 turn 不花费任何 step', tone: 'rose' },
+
+      { type: 'phase', label: 'step：模型请求' },
+      { type: 'msg', from: 'Driver', to: 'Session', label: 'step/start', tone: 'accent' },
+      { type: 'msg', from: 'Driver', to: 'Session', label: 'user/message（每条 entered 消息）', tone: 'accent' },
+      { type: 'msg', from: 'Driver', to: 'Prompt', label: 'system-prompt/assemble (waterfall)', tone: 'lime' },
+      { type: 'self', at: 'Driver', label: 'deriveMessages() 从日志算出消息历史', tone: 'accent' },
+      { type: 'msg', from: 'Driver', to: 'LLM', label: 'agent/request → llm/stream', tone: 'violet' },
+      { type: 'msg', from: 'LLM', to: 'Driver', label: 'StreamChunk*', style: 'return', tone: 'violet' },
+      { type: 'msg', from: 'Driver', to: 'Session', label: 'assistant/chunk*', tone: 'accent' },
+      { type: 'note', label: '请求失败：先 step/end，再走 agent/request-error waterfall 决定重试或保留原错误', tone: 'rose' },
+      { type: 'msg', from: 'Driver', to: 'Session', label: 'assistant/message', tone: 'accent' },
+
+      { type: 'phase', label: 'step：工具批次' },
+      { type: 'msg', from: 'Driver', to: 'Tools', label: '按 executionMode 分类待执行调用', tone: 'rose' },
+      { type: 'msg', from: 'Driver', to: 'Session', label: 'tool/call', tone: 'accent' },
+      { type: 'msg', from: 'Driver', to: 'Tools', label: '有序 pre，并发 execute', tone: 'rose' },
+      { type: 'msg', from: 'Tools', to: 'Session', label: '工具自有事件（如适用）', style: 'async', tone: 'rose' },
+      { type: 'msg', from: 'Driver', to: 'Tools', label: '按模型顺序做 post', tone: 'rose' },
+      { type: 'msg', from: 'Driver', to: 'Session', label: 'tool/result', tone: 'accent' },
+      { type: 'msg', from: 'Driver', to: 'Session', label: 'step/end', tone: 'accent' },
+      { type: 'note', label: '工具还欠一次请求，或新的 next-step 输入到了 → 再 claim → 下一个 step' },
+
+      { type: 'phase', label: 'turn 收尾' },
+      { type: 'msg', from: 'Driver', to: 'Hooks', label: 'agent/turn-stopping (serial 终止检查点)', tone: 'amber' },
+      { type: 'msg', from: 'Driver', to: 'Session', label: 'turn/end', tone: 'accent' },
+      { type: 'msg', from: 'Driver', to: 'Session', label: 'agent/status idle', style: 'async', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+## inbox：唯一的输入口
+
+输入通过**一个 inbox** 到达 driver。这条设计让「用户说话」「系统注入上下文」「被 steer」在语义上归一。
+
+<Figure
+  kind="状态图"
+  title="三种投递方式的唤醒语义"
+  caption={
+    <>
+      区别只在<strong>是否立刻唤醒</strong>。<code>inject</code> 的上下文会在 inbox 里等待，直到另一条消息把 driver 叫起来——所以单独 inject 不会自己触发一次 turn。
+    </>
+  }
+>
+  <Matrix
+    corner="投递方式"
+    cols={['是否立刻唤醒 driver', '典型用途']}
+    rows={[
+      {
+        label: 'followup(content)',
+        cells: [
+          { label: '是', tone: 'lime' },
+          { label: '用户的下一句话', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'steer(...)',
+        cells: [
+          { label: '是', tone: 'lime' },
+          { label: '在飞行中改变方向', tone: 'neutral' },
+        ],
+      },
+      {
+        label: 'inject(...)',
+        cells: [
+          { label: '否，等待', tone: 'amber' },
+          { label: '加入模型看得见的上下文，等下一次被接受的请求一起进去', tone: 'neutral' },
+        ],
+      },
+    ]}
+  />
+</Figure>
+
+被 claim 的批次会经过同一个 `agent/pre-step` waterfall——steering 与注入的上下文都不例外，它们只是在**更晚的一次 claim 操作**里被取走。
+
+## agent/pre-step：决定模型看到什么
+
+这是整条循环里权力最大的扩展点。
+
+<Fanout
+  source={{ title: 'agent/pre-step', sub: 'waterfall', kind: 'gate', tone: 'amber' }}
+  targets={[
+    {
+      label: 'reject',
+      title: '关闭一个零 step 的 turn',
+      sub: '日志仍记录这次尝试',
+      tone: 'rose',
+    },
+    {
+      label: 'enter(messages)',
+      title: '进入 step',
+      sub: 'messages 可被改写',
+      tone: 'lime',
+    },
+    {
+      label: 'enter + startsRequestSeries',
+      title: '开启一个新的消息序列',
+      sub: '记一条新的 request/header',
+      tone: 'violet',
+    },
+  ]}
+/>
+
+<Callout variant="rule" title="返回值说了算">
+  包装 <code>next()</code> 的监听器<strong>必须保留</strong>下游的 messages 与{' '}
+  <code>startsRequestSeries</code>，除非你就是要换掉它们。重建下游 enter 决策时要展开原对象：
+  <code>{'{ ...decision, messages }'}</code>，否则那个声明会被丢掉。
+</Callout>
+
+关于 `startsRequestSeries` 的精确后果：循环会记一条新的 `request/header`，原因是 `series`；如果连请求信封也变了，原因是 `change` 并带上 `startsSeries: true`。
+
+## 每个 step 读一次提示与工具 schema
+
+不是启动时装配一次，而是**每个 step 都读**插件注册的提示段落与工具 schema。这就是为什么「挂一个插件」能立刻改变模型在下一步看到的东西。
+
+<Flow
+  dir="col"
+  nodes={[
+    { title: '插件注册提示段落 / 工具 schema', sub: 'ctx.effect()', kind: 'plugin', tone: 'neutral' },
+    { title: 'system-prompt/assemble', sub: 'waterfall', kind: 'gate', tone: 'lime', edge: '每个 step' },
+    { title: '这一步的系统提示 + 工具 schema', kind: 'plain', tone: 'lime', edge: '装配结果' },
+    { title: 'agent/request', sub: 'waterfall', kind: 'gate', tone: 'violet', edge: '构造请求' },
+  ]}
+/>
+
+## 错误恢复与压缩
+
+`assistant/message` 事件会记录**每一次成功的 provider 调用**，包括没有内容的、以及以 `max-tokens` 结束的。空内容不进入消息历史，但持久事件仍保留 usage 与 `sourceEventSeqs`——后者精确列出对应的 `assistant/chunk` 事件，允许是显式的空列表。
+
+<Figure
+  kind="生命周期"
+  title="压缩（compaction）如何插进失败恢复的缝隙里"
+  caption={
+    <>
+      恢复发生在<strong>已关闭的失败 step</strong> 与<strong>失败 turn 的关闭</strong>之间。只有剪枝或摘要真的推进了 surface 替换代号，才会再开一个重试 turn；否则仍以原来的请求错误为准。
+    </>
+  }
+>
+  <Timeline
+    items={[
+      {
+        at: 'agent/pre-step',
+        title: '在算出请求之前检查压力',
+        body: (
+          <>
+            <code>dsh-compaction-basic</code> 在这里处理上下文压力——也就是「还没发请求就知道要超」。
+          </>
+        ),
+        tone: 'lime',
+      },
+      {
+        at: 'agent/request-error',
+        title: '仅用于规范化的上下文溢出',
+        body: '不是所有请求错误都走压缩，只有被判定为上下文溢出的那一类。',
+        tone: 'amber',
+      },
+      {
+        at: '（触发条件满足后）',
+        title: '可选的工具结果剪枝先于摘要选择',
+        body: '先扔掉最便宜的东西，再考虑摘要。',
+        tone: 'violet',
+      },
+      {
+        at: 'surface 替换代号推进',
+        title: '开启一个新的重试 turn',
+        body: '如果剪枝与摘要都没有推进代号，就不重试——仍以原来的错误为准。',
+        tone: 'rose',
+      },
+    ]}
+  />
+</Figure>
+
+## agent/turn-stopping：终止检查点
+
+它只在**自然停止且 next-step inbox 为空**时触发。它是 serial 的，没有 `next()`，因此它的返回值直接决定 turn 是否真的结束——这是「让 agent 自己决定要不要再干一轮」的挂点。
+
+## 给 SDK 与 UI 的选择建议
+
+<Split>
+  <Panel title="要可回放的转录数据 → session/event" tone="accent">
+    因为持久事实全在日志里，`session/event` 是唯一能保证「重载后还在」的来源。转录、审计、离线分析都用它。
+  </Panel>
+  <Panel title="要活的协调能力 → agent/*" tone="violet">
+    队列与状态、提示拦截、请求构造、steering、续跑、错误处理——这些都是 `agent/*` 的职责，它是**实时**协调 API。
+  </Panel>
+</Split>

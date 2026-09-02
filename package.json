@@ -1,0 +1,53 @@
+{
+  "name": "dsh-learn",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeepSeek Harness technical atlas: architecture, data flow and lifecycle for engineers",
+  "type": "module",
+  "engines": {
+    "node": "^20.9.0 || ^22.11.0 || >=24"
+  },
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "content-index": "node scripts/build-content-index.mjs",
+    "predev": "node scripts/build-content-index.mjs",
+    "dev": "next dev --port 4123 --webpack",
+    "dev:turbo": "next dev --port 4123 --turbopack",
+    "prebuild": "node scripts/build-content-index.mjs",
+    "build": "node --max-old-space-size=4096 ./node_modules/next/dist/bin/next build",
+    "start": "node scripts/serve-static.mjs",
+    "preview": "pnpm run build && node scripts/serve-static.mjs",
+    "typecheck": "node scripts/build-content-index.mjs && tsc --noEmit",
+    "install:isolated": "pnpm install --ignore-workspace"
+  },
+  "dependencies": {
+    "@mdx-js/loader": "^3.1.1",
+    "@mdx-js/react": "^3.1.1",
+    "@next/mdx": "^16.3.4",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "geist": "^1.7.2",
+    "github-slugger": "^2.0.0",
+    "lucide-react": "^1.39.0",
+    "motion": "^13.1.1",
+    "next": "^16.3.4",
+    "next-themes": "^0.4.6",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "rehype-pretty-code": "^0.14.5",
+    "rehype-slug": "^6.0.0",
+    "remark-gfm": "^4.0.1",
+    "shiki": "^4.3.1",
+    "tailwind-merge": "^3.6.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/mdx": "^2.0.14",
+    "@types/node": "^26.4.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "postcss": "^8.5.26",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^6.0.3"
+  }
+}

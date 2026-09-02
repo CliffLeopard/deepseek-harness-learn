@@ -1,0 +1,365 @@
+## 插件是贡献，不是内核补丁
+
+`dsh` 没有特权内核。你要加的东西——工具、策略、提示段落、适配器、UI——都写成一个插件，再挂进那棵已经在跑的树。
+
+这一章只回答两件事：
+
+1. **怎么写**一个会被 Cordis 挂上的模块。
+2. **它怎样进入一次 turn**：从 `cordis.yml` 的一行，到模型看见的工具、被拦住的调用、或写进日志的事件。
+
+<Callout variant="key">
+  新行为挂在已经写明的扩展点上。不要改 <code>agent-loop</code>。要改循环本身，必须同时改{' '}
+  <code>docs/architecture.md</code> 里的扩展点地图。
+</Callout>
+
+## 三种包，三种进树方式
+
+先分清你在写哪一种。名字都叫「插件」时，进树的路完全不同。
+
+<DataTable
+  head={['种类', '怎么进树', '怎么认']}
+  rows={[
+    ['plugin', 'cordis.yml / patch 里的一行：name 指向模块', '导出 apply，或默认导出一个 Service'],
+    ['bundle', 'dsh plugin --profile web add 某个 bundle 包', 'package.json 里有 dsh.bundle.patch'],
+    ['library', '只作为别的包的依赖', '没有 apply，也没有独立的安装命令'],
+  ]}
+/>
+
+<Callout variant="trap" title="dsh plugin add 只激活 bundle">
+  普通插件不会因为跑了这条命令就出现在树上。它必须作为{' '}
+  <code>cordis.yml</code> 的一行被 Loader 挂上——写进某个 bundle、profile 的{' '}
+  <code>cordis.patch.yml</code>，或命令行 <code>--patch</code>。
+</Callout>
+
+仓库里的例子：`packages/todo/tool-todo` 是 plugin（`export function apply`）；`packages/bundle/base` 是 bundle，它的 `cordis.patch.yml` 用一行把 `@deepseek-ai/dsh-tool-todo` 挂进去。
+
+## 最小插件
+
+Cordis 加载模块时，用当前的 `ctx` 调用 `apply`。你不写启动代码：插件只描述自己贡献什么，组合文件决定挂哪些。
+
+```ts
+import type { Context } from '@deepseek-ai/cordis'
+
+export const name = 'hello'
+export const inject = ['tools']
+
+export function apply(ctx: Context) {
+  ctx.tools.register(myTool)
+}
+```
+
+<DefList
+  items={[
+    {
+      term: 'name',
+      sig: '可选',
+      desc: '诊断里用来认出这个插件。',
+    },
+    {
+      term: 'inject',
+      sig: "['tools']",
+      desc: '声明要等哪些服务。服务齐了才调用 apply；服务没了，这个插件被回收。',
+    },
+    {
+      term: 'apply(ctx)',
+      sig: '挂载入口',
+      desc: '在这里注册工具、提示、监听器。register() 返回 disposer，卸载这个插件的 fiber 时会一起撤销。',
+    },
+    {
+      term: 'Config',
+      sig: 'cordis.yml 的 config',
+      desc: '会随部署变化的选择，必须是校验过的字段，能从配置改。DEFAULT_* 常量不算可配置。',
+    },
+  ]}
+/>
+
+另外两种写法在 [第 02 章](/docs/cordis)：带 `apply` 方法的对象，以及占据 `ctx` 上某个服务键的 `Service` 子类。在需要公开服务之前，用函数即可。
+
+<Callout variant="warn" title="列表顺序不决定谁先跑">
+  <code>cordis.yml</code> 里的行是并发启动的。先后由 <code>inject</code> 决定：你声明要等{' '}
+  <code>tools</code>，就会等到 <code>ctx.tools</code> 出现才 apply。
+</Callout>
+
+<Callout variant="rule" title="加载失败要响，不能假装没这行">
+  <code>apply</code> 抛错会让进程退出。模块路径或包名拼错时，Loader 记一条错误，不会默默跳过——看起来「挂了没效果」，先查拼写。
+</Callout>
+
+## 从配置行到一次 turn
+
+这是插件融入整体流程的完整路径。
+
+<Figure
+  kind="数据流"
+  scroll
+  title="一行配置如何变成模型看得见的能力"
+  caption={
+    <>
+      左边是启动时发生一次的事；右边是<strong>每一个 step</strong> 都会再走一遍的事。
+      所以你挂上的工具 schema、提示段落，会在下一步请求里立刻出现，不必重启循环。
+    </>
+  }
+>
+  <Flow
+    nodes={[
+      { title: 'cordis.yml / patch 行', sub: 'id + name + config', kind: 'plain', tone: 'neutral' },
+      { title: 'Loader 解析模块', sub: 'name 是包名或路径', kind: 'gate', tone: 'amber', edge: '启动时' },
+      { title: 'inject 等待服务', sub: 'ctx.tools / ctx.llm / …', kind: 'service', tone: 'violet', edge: '依赖齐了' },
+      { title: 'apply(ctx)', sub: 'register / on / section', kind: 'plugin', tone: 'accent', edge: '挂上 effect' },
+      { title: '每个 step 再装配', sub: 'system-prompt/assemble', kind: 'gate', tone: 'lime', edge: '读注册表' },
+      { title: '模型请求 / 工具管线', sub: 'agent/request · tools/*', kind: 'event', tone: 'rose', edge: '进入 turn' },
+    ]}
+  />
+</Figure>
+
+对照 [第 06 章](/docs/lifecycle) 的循环：
+
+<Pipeline
+  stages={[
+    {
+      title: 'agent/pre-step',
+      sub: 'waterfall',
+      tone: 'amber',
+      body: '钩子插件决定模型看见哪些消息；可以 reject，这时 turn 开了但不花 step。',
+    },
+    {
+      title: 'system-prompt/assemble',
+      sub: 'waterfall',
+      tone: 'lime',
+      body: '读你注册的提示段落和工具 schema。每个 step 都读，所以中途挂上的插件下一步就生效。',
+    },
+    {
+      title: 'agent/request → llm/stream',
+      sub: '适配器 seam',
+      tone: 'violet',
+      body: '模型适配器插件接住请求。循环只认识 StreamChunk。',
+    },
+    {
+      title: 'tools/pre-execute → execute → post-execute',
+      sub: 'waterfall',
+      tone: 'rose',
+      body: '策略、审批、超时、改写结果都挂在这里，不必改循环。',
+    },
+    {
+      title: 'session/event',
+      sub: 'emit',
+      tone: 'accent',
+      body: 'UI 与协议桥只听日志。输入走 agent.followup() / steer()，不要自己造第二条历史。',
+    },
+  ]}
+/>
+
+## 四种最常见的插件
+
+### 1. 给模型用的工具
+
+注册到 `ctx.tools`。schema 会自动进提示装配。
+
+```ts
+import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+
+export const name = 'greet-tool'
+export const inject = ['tools']
+
+export function apply(ctx: Context) {
+  ctx.tools.register(defineTool({
+    name: 'greet',
+    description: 'Greet someone by name.',
+    parameters: {
+      name: { type: 'string', required: true, description: 'The name to greet' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(args) {
+      return `Hello, ${args.name}!`
+    },
+  }))
+}
+```
+
+`defineTool` 会按 schema 校验模型传来的 JSON，再交给 `execute`。你返回的是规范值；`output.render` 再变成模型看见的内容。细节在 [第 08 章](/docs/tools) 和仓库 `docs/cookbook/adding-a-tool.md`。
+
+本地试跑（必须走 `dsh` 加 profile，不能用包自己的 bin）：
+
+```sh
+pnpm dsh web --patch ./scratch-plugin/cordis.yml
+```
+
+对应的 patch 只需要一行，指向你的模块。
+
+### 2. 钩子 / 策略
+
+不注册新工具，只在已有管线上拦一把。waterfall **必须调用 `next()`**，否则整条链短路。emit / parallel / serial / bail 什么时候用，见 [第 02 章](/docs/cordis#事件派发模式)。
+
+```ts
+import type { Context } from '@deepseek-ai/cordis'
+import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
+
+export const name = 'permission-gate'
+
+export function apply(ctx: Context) {
+  ctx.on('tools/pre-execute', async (exec: ToolExecution, next): Promise<PreToolDecision> => {
+    if (!(await isAllowed(exec))) {
+      return { kind: 'deny', reason: 'Denied by policy.' }
+    }
+    return next()
+  })
+}
+
+declare function isAllowed(exec: ToolExecution): Promise<boolean>
+```
+
+选点的规则：
+
+<DataTable
+  head={['你想做的事', '挂在哪']}
+  rows={[
+    ['允许 / 拒绝 / 询问一次工具调用', 'tools/pre-execute；问用户走 ctx.approval'],
+    ['后面的人不能再放行的最终拒绝', 'ctx.tools.guard()'],
+    ['给这次执行加超时、重试、计量', 'tools/execute（只能换 exec.signal）'],
+    ['改写给模型看的结果，或附上上下文', 'tools/post-execute'],
+    ['只观察已经冻结的结果', 'tools/result'],
+    ['改模型即将看到的输入', 'agent/pre-step'],
+    ['turn 自然结束时再决定要不要续', 'agent/turn-stopping（serial，没有 next()）'],
+  ]}
+/>
+
+### 3. 提示段落与动态上下文
+
+```ts
+export const inject = ['systemPrompt']
+
+export function apply(ctx: Context) {
+  ctx.systemPrompt.section({
+    name: 'my-guidance',
+    order: 5100,
+    text: 'Prefer the greet tool when the user asks for a hello.',
+  })
+}
+```
+
+稳定的指导写成 `PromptSection`（进系统提示前缀）。会变的事实写成 `PromptContext`，变成 user-role 快照，没变就不必重写。每个 step 重新装配，所以 scope 上的 shadowing 和 restriction 能在 turn 中途生效。见 [第 13 章](/docs/context)。
+
+### 4. 界面或协议桥
+
+听 `session/event` 画界面；人说的话用 `agent.followup()` 送回 inbox。不要自己存一份模型历史——历史从日志算出来。
+
+浏览器里的 Web Client 另有一套：注册 `ConversationNodeDefinition` 和带 key 的 renderer，见 [第 14 章](/docs/web)。
+
+## 怎样挂进正在跑的产品
+
+<Steps
+  items={[
+    {
+      title: '仓库里的官方能力',
+      body: (
+        <>
+          在某个 bundle 的 <code>cordis.patch.yml</code> 里 insert 一行，<code>id</code> 稳定，
+          <code>name</code> 是包名。例如 <code>dsh-base</code> 里的 <code>id: tool-todo</code>。
+          后面的层可以按 id 整行替换它的 config。
+        </>
+      ),
+    },
+    {
+      title: '你自己的机器 / 某一个 profile',
+      body: (
+        <>
+          写进 Harness home 里该 profile 的 <code>cordis.patch.yml</code>，或 home 根上跨
+          profile 的那份。分层顺序见 <a href="/docs/composition">第 03 章</a>。
+        </>
+      ),
+    },
+    {
+      title: '一次实验',
+      body: (
+        <>
+          <code>dsh --profile web --patch ./my-plugin/cordis.yml</code>。
+          <code>--patch</code> 最后应用，权力最大，适合临时试验。
+        </>
+      ),
+    },
+  ]}
+/>
+
+<Callout variant="warn" title="裸插件名必须出现在解析它的 manifest 的 dependencies 里">
+  Raw / Web 的 <code>cordis.yml</code> 里写的包名，要能被那份 resolver manifest 解析到。
+  <code>verify-cordis-config</code> 会检查这件事。只把包放在磁盘上、不写进 dependencies，启动时会失败。
+</Callout>
+
+某个**会话**要和别人不同的工具集，用 agent preset，不是再叠一层全局 patch。preset 里的服务行需要 `isolate` realm。
+
+## 先问：这件事落在哪一层
+
+选错层，后面的 subagent、恢复、压缩会对不上。
+
+<Fanout
+  source={{ title: '我要加的行为', kind: 'gate', tone: 'accent' }}
+  targets={[
+    {
+      label: '模型能调用的能力',
+      title: 'ctx.tools.register',
+      sub: '第 08 章 · 工具管线',
+      tone: 'lime',
+    },
+    {
+      label: '换一种实现',
+      title: 'seam 的 Provider',
+      sub: '第 10 章 · 三个角色',
+      tone: 'violet',
+    },
+    {
+      label: '拦一次请求或工具',
+      title: 'agent/* 或 tools/*',
+      sub: '第 06 章 · 扩展点',
+      tone: 'amber',
+    },
+    {
+      label: '模型看见的额外文字',
+      title: 'section / inject',
+      sub: '第 13 章 · 装配',
+      tone: 'rose',
+    },
+  ]}
+/>
+
+更完整的「目标 → 机制」表在 [第 05 章](/docs/core-spine) 末尾。仓库对照表在 `docs/cookbook/extension-cookbook.md`。
+
+<Callout variant="trap" title="MCP、hook 文件、skill 都不是另一套循环">
+  MCP 是「发现工具 → <code>ctx.tools.register()</code>」。Claude Code / Codex hook 桥是把配置文件映射到{' '}
+  <code>agent/pre-step</code>、<code>tools/pre-execute</code> 这些扩展点。skill 目录是{' '}
+  <code>agent/pre-step</code> 注入的 user-role catalog，不进系统提示。
+</Callout>
+
+## 写完之后还要过的门
+
+<Cards
+  cols={2}
+  items={[
+    {
+      title: '注册必须能撤销',
+      meta: 'ctx.effect()',
+      tone: 'accent',
+      body: 'HMR 和按 agent 划分的 scope 都靠这件事。register() 要返回 disposer。',
+    },
+    {
+      title: '模型看得见的，日志里要有',
+      meta: 'SessionEvent',
+      tone: 'violet',
+      body: '新的模型可见输入先加会话事件，再让它进入请求。',
+    },
+    {
+      title: '工具的 UI 要一起设计',
+      meta: 'presentCall / presentResult',
+      tone: 'lime',
+      body: 'Host presenter 是纯函数；Web 卡片从事件和持久化元数据算出来，不 import Host 实现。',
+    },
+    {
+      title: '过对应的测试层',
+      meta: '第 16 章',
+      tone: 'amber',
+      body: '模型或用户看得见的改动，要更新不依赖 API key 的录制会话快照。',
+    },
+  ]}
+/>

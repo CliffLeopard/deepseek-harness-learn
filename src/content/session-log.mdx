@@ -1,0 +1,359 @@
+## 一条仅追加的日志
+
+一个 `Session` 是一条**仅追加**的 `SessionEvent` 日志——它是一个 agent 整段交互历史的**唯一真相**。
+
+<Callout variant="key">
+  LLM 消息历史是从日志<strong>算出来</strong>的，从不单独存储；回放就是用同一批事件再算一遍。
+</Callout>
+
+日志本身的持久化（持久化 seam、后端、崩溃恢复）是**另一个**关注点：`ctx.sessions` 只管内存里的事件溯源模型。
+
+## 事件传播
+
+<Figure
+  kind="数据流"
+  scroll
+  title="append 一次事件之后发生的事"
+  caption={
+    <>
+      <code>append</code> 是<strong>同步提交</strong>的：事件一旦进入日志，追加即已提交——观察者失败会被逐个监听器记录并隔离，既不改变返回值，也不阻止后面的监听器观察同一个已接受事件。热路径<strong>从不</strong>阻塞在 I/O 上，持久化插件是异步缓冲的。
+    </>
+  }
+>
+  <Flow
+    nodes={[
+      { title: 'session.append(type, data, opts)', kind: 'plain', tone: 'neutral' },
+      { title: '无损 JSON 校验', sub: 'isJsonValue', kind: 'gate', tone: 'amber', edge: '同步' },
+      { title: 'surface 候选校验', sub: 'SurfaceManager', kind: 'gate', tone: 'amber', edge: '提交前' },
+      { title: '推入日志', sub: 'seq = log.length', kind: 'store', tone: 'accent', edge: '提交' },
+      { title: 'session/event', sub: 'emit', kind: 'event', tone: 'lime', edge: '广播' },
+      { title: '持久化 / 遥测 / UI', kind: 'io', tone: 'neutral', edge: '异步缓冲' },
+    ]}
+  />
+  <Legend
+    items={[
+      { label: '决策/校验点', tone: 'amber', kind: 'gate' },
+      { label: '日志（唯一真相）', tone: 'accent', kind: 'store' },
+      { label: '事件广播', tone: 'lime', kind: 'event' },
+      { label: '进程外', tone: 'neutral', kind: 'io' },
+    ]}
+  />
+</Figure>
+
+<Callout variant="warn" title="append 会在源头抛错">
+  如果 <code>data</code> 或 surface 元数据不是无损 JSON（BigInt、函数、symbol、undefined、负零、非有限数、循环引用、稀疏数组，或者 Map/Set/Date/类实例这类异常对象），
+  <code>append</code> 直接抛错。日志是持久真相，所以坏事件<strong>在追加点</strong>失败，而不是等到后端 flush 时才炸。
+</Callout>
+
+## SessionEvent：一条日志条目
+
+它是对 `type` 的**真正判别联合**（不是互相独立的 `type` / `data` 联合），所以 `switch (event.type)` 能直接收窄 `event.data`，不需要类型断言。
+
+<DefList
+  items={[
+    { term: 'type', sig: 'keyof SessionEventMap', desc: '判别标签。' },
+    { term: 'seq', sig: 'SessionSeq', desc: '日志内的单调位置，契约是 seq = log.length（连续，不允许空洞）。' },
+    { term: 'time', sig: 'number', desc: 'Unix epoch 毫秒。' },
+    { term: 'data', sig: 'SessionEventMap[type]', desc: '载荷；进入日志的是它的快照，不是调用者仍可变的输入。' },
+    {
+      term: 'ignorable',
+      sig: 'true | 缺省',
+      desc: '标记「读取方不认识 type 时可以安全跳过」。缺省即必需——读到不认识且没有这个标记的事件，读取方必须拒绝重建会话，而不是静默丢弃。',
+    },
+    {
+      term: 'sourceEventSeqs',
+      sig: '仅 SurfaceEventType',
+      desc: '这条事件引用的更早事件的 seq，例如组装出 assistant/message 的那些 assistant/chunk。',
+    },
+    {
+      term: 'surfaceOp',
+      sig: '仅 SurfaceEventType',
+      desc: '这条事件如何加入 surface。非 surface 事件永远不带它，编译器在 append() 调用点强制这一点。',
+    },
+  ]}
+/>
+
+<Callout variant="rule" title="默认必需，忘记标记只会过度拒绝">
+  写入方只在<strong>纯信息性、丢了也不影响重建</strong>的记录上设 <code>ignorable: true</code>。
+  默认必需的意义是：忘记标记会导致过度拒绝（不方便），而不是静默地恢复出一个被掏空的会话。
+</Callout>
+
+<Callout variant="trap" title="不要在 SessionEvent 的 switch 上用 assertNever">
+  因为 <code>SessionEventMap</code> 是<strong>可合并扩展</strong>的——插件加的变体是合法的未知值。
+  处理已知情况，然后走一个有文档的 <code>default</code> 分支。
+</Callout>
+
+## 事件词汇表（核心成员）
+
+<DataTable
+  head={['事件', '载荷要点', '是 surface 事件吗']}
+  rows={[
+    ['turn/start', '{ turn }', '否'],
+    ['turn/end', '{ turn, reason: TurnEndReason }', '否'],
+    ['step/start · step/end', '{ turn, step }', '否'],
+    ['user/message', 'UserMessage（source 区分人类输入 / 注入上下文 / 目标续跑）', '是'],
+    ['assistant/chunk', '{ turn, step, chunk: StreamChunk }', '否（回放与 UI 保真度）'],
+    ['assistant/message', '{ message, usage?, interrupted? }', '是'],
+    ['tool/call', '{ callId, name, arguments }（原始未解析 JSON 字符串）', '否'],
+    ['tool/result', '{ message, error?, meta? }', '是'],
+    ['request/header', '{ header: EpochHeader, reason, startsSeries? }', '否（仅日志）'],
+    ['request/context', 'RequestContext（provider / model / contextWindow?）', '否（仅日志）'],
+    ['session/end-seed', '空载荷；位置与 time 承载全部含义', '否（仅日志）'],
+  ]}
+/>
+
+## surface：用来算出消息历史的唯一来源
+
+只有三种事件会产出 LLM 消息，它们组成 `SurfaceEventType`：
+
+<Cards
+  cols={3}
+  items={[
+    { title: 'user/message', meta: 'SurfaceEventType', tone: 'accent', body: '原样变成它的 content。' },
+    { title: 'assistant/message', meta: 'SurfaceEventType', tone: 'violet', body: '带上产出它的 provider 与 model。' },
+    { title: 'tool/result', meta: 'SurfaceEventType', tone: 'lime', body: '变成一条带着 tool-result 块的 user 消息。' },
+  ]}
+/>
+
+每一个产出消息的 append **必须**声明 `surfaceOp`，这是编译期强制的。
+
+<Figure
+  kind="状态图"
+  title="SurfaceOp 的两种形态"
+  caption={
+    <>
+      <code>replace</code> 会盖住 <code>start</code> 到 <code>end</code>（含两端）的 surface 节点，并把新事件插在它们的位置。新节点的{' '}
+      <code>sourceEventSeqs</code> <strong>必须包含每一个被盖住的 surface 节点</strong>。压缩使用它，任何做 surface 替换的生产者都可以用。
+    </>
+  }
+>
+  <Matrix
+    corner="surfaceOp"
+    cols={['语义', '典型使用者']}
+    rows={[
+      {
+        label: "'append'",
+        cells: [
+          { label: '加到尾部——用户/助手/工具消息的常规路径', tone: 'lime' },
+          { label: 'agent-loop', tone: 'neutral' },
+        ],
+      },
+      {
+        label: "{ op: 'replace', start, end }",
+        cells: [
+          { label: '用这个节点替换 start..end（含）范围内的 surface 节点', tone: 'amber' },
+          { label: 'compaction、tool-result 剪枝', tone: 'neutral' },
+        ],
+      },
+    ]}
+  />
+</Figure>
+
+<Callout variant="note" title="给人看的转录，和 surface 算出的消息，不是同一份">
+  给人看的转录<strong>读的是日志里 append 来源的事件</strong>，不是 surface——因为 surface 会盖住被摘要替换掉的那段。
+  两者的判据是 <code>isAppendSurfaceEvent</code>。
+</Callout>
+
+## deriveMessages() 怎么把事件变成消息
+
+<DataTable
+  head={['事件', '变成什么']}
+  rows={[
+    ['user/message', 'user 消息，携带精确的 content；可选的信封仍然只是日志级展示元数据'],
+    ['assistant/message', 'assistant 消息 + 产出它的 provider/model + 可选的适配器私有回放状态'],
+    ['assistant/chunk', '跳过——它是回放/UI 数据，组装后的消息才算数'],
+    ['空内容的 assistant/message', '跳过——max-tokens 截断步仍会记录事件以保存 usage，但无内容的助手轮次不得进入 provider 转录'],
+    ['tool/result', '携带 tool-result 块的 user 消息'],
+    ['turn/* · step/* · llm/retry', '结构性事件，不成消息'],
+  ]}
+/>
+
+`deriveMessages()` 是**带缓存**的：每个 surface 节点只转换一次（首次见到时），所以一次调用的开销是 O(新节点)；surface 被重写（一次 `replace`，也就是 `replaceGeneration` 递增）会触发重建。返回的数组每次调用都是新快照，但里面的 `Message` 对象是**共享且深冻结**的。
+
+## request/header：让请求成为日志的纯函数
+
+请求信封—— `EpochHeader`——是**被记录的会话状态**，因此每一次对话请求都是日志的纯函数。
+
+<DefList
+  items={[
+    { term: 'config', sig: 'LlmCallConfig', desc: '对话的调用配置：provider、model、reasoning effort 与采样标量。' },
+    { term: 'adapterDefaults', sig: 'LlmCallConfigAdapterDefaults?', desc: '适配器真正生效的配置字段，不是调用方提议的值。' },
+    { term: 'system', sig: 'string?', desc: '渲染后的系统提示文本；无系统提示的请求里这个字段缺省。' },
+    { term: 'tools', sig: 'ToolSchema[]?', desc: '装配好的工具 schema；无工具的请求里缺省。' },
+  ]}
+/>
+
+<Figure
+  kind="状态图"
+  title="四种 request/header 原因"
+  caption={
+    <>
+      同一个模型消息序列里，普通的后续 turn、更多的 step 与重试都<strong>继承</strong>最近一次快照。
+      <code>foldRequestHeader(events)</code> 通过选取最近一次快照来重建 header。
+    </>
+  }
+>
+  <Timeline
+    items={[
+      { at: "reason: 'initial'", title: '记录一个循环实例边界', body: '完整快照。', tone: 'accent' },
+      { at: "reason: 'resume'", title: '记录一个循环实例边界', body: '完整快照。', tone: 'accent' },
+      {
+        at: "reason: 'change'",
+        title: '请求变了',
+        body: (
+          <>
+            追加一次快照；如果这次请求同时开启一个序列，则带上 <code>startsSeries: true</code>。
+          </>
+        ),
+        tone: 'amber',
+      },
+      {
+        at: "reason: 'series'",
+        title: '信封未变但显式声明了新序列',
+        body: '或者紧随一次 surface 替换之后。',
+        tone: 'violet',
+      },
+    ]}
+  />
+</Figure>
+
+`request/context` 是**另一条**被记录的状态：它描述请求解析到的那条路由的上下文元数据，只在 provider、model 或容量与上一条记录不同时才追加。它故意留在 `EpochHeader` 之外，因为后者是被 `headerEquals` 逐字段比较的重建契约——容量描述的是**路由**，不是请求输入。
+
+## ctx.sessions：SessionStore
+
+<DefList
+  items={[
+    {
+      term: 'create(id?, options?)',
+      sig: 'Session',
+      desc: '创建一个由调用 fiber 拥有的会话：该 fiber 被 dispose 时，事件通知停止且会话从 store 移除。',
+    },
+    {
+      term: 'prepare(id?, options?)',
+      sig: 'Session',
+      desc: '构造但不入 store。与 enter + announce 搭配，让拥有复合 effect 的调用方把会话生命周期折进同一个 effect。',
+    },
+    {
+      term: 'enter(session)',
+      sig: '() => void',
+      desc: '装上模块私有的 append 发布钩子并入 store，返回 detach disposer。它不发 session/created。',
+    },
+    {
+      term: 'announce(session)',
+      sig: 'void',
+      desc: '对一个已 enter 的会话恰好发一次 session/created。与 enter 分开，是为了让调用方先交出 disposer 以获得回滚安全。',
+    },
+    {
+      term: 'flush(session)',
+      sig: 'Promise<boolean>',
+      desc: '派发被 await 的 session/flush 持久化检查点。它是唯一的 flush 入口——不要自己 ctx.parallel。',
+    },
+    {
+      term: 'fork(source, boundary?, childSessionId?)',
+      sig: 'Session',
+      desc: '从一个活会话的稳定前缀创建活的子会话。boundary 是包含式的源事件 seq。',
+    },
+    { term: 'get(id) / list()', sig: 'Session | undefined / Session[]', desc: '查找与列出活会话。' },
+  ]}
+/>
+
+<Callout variant="rule" title="fork 拒绝落在打开的 turn 里的前缀">
+  被选中的前缀<strong>必须结束在一个打开的 turn 之外</strong>。API 会直接拒绝，而不是静默地裁剪。
+  显式 <code>boundary</code> 允许从任意稳定的 turn 间位置 fork——包括更早的一个 <code>turn/end</code>，即使源已经有更新的事件或有一个打开的当前 turn。
+</Callout>
+
+`dsh-subagent-fork-in-process` 保留它自己的「裁剪到完成前缀」行为，因为工具时刻的委派通常在父 turn 仍然打开时开始；而普通的会话分支应当把请求的边界写明。
+
+## turn 为什么结束：TurnEndReason
+
+<DataTable
+  head={['reason.kind', '含义']}
+  rows={[
+    ['completed', '正常完成'],
+    ['aborted', '取消请求中断了活的 turn，携带类型化的 AgentCancelCause'],
+    ['blocked', '被阻塞'],
+    ['error', '失败；error 一律是结构化失败（LlmError 事实原样，或被扁平成 { message, code: "UNKNOWN" }）'],
+    ['max-tokens', '至少一个 step 触到输出 token 上限——即使插件让 turn 继续了'],
+    ['interrupted', '持久化后端在重载时关闭了一个因崩溃而孤立的 turn；循环从不发这个标记'],
+  ]}
+/>
+
+<Callout variant="note" title="max-tokens 会赢过后续的继续">
+  一个 turn 里只要有任何一个 step 是 <code>max-tokens</code>，整个 turn 就以{' '}
+  <code>max-tokens</code> 结束，而不是 <code>completed</code>——「被截断」这个事实优先于后来的继续，好让消费者能区分「干净停止」与「被截断」。
+</Callout>
+
+## session/end-seed：种子与活写入的分界
+
+带显式种子构造的 Session（restore、fork 或 replay）会在种子之后立刻追加这条**仅日志**事件，作为它的第一次活写入。
+
+<Callout variant="key">
+  它存在的理由是：<strong>种子历史与活的工作在字节上完全一样</strong>。这会让任何拥有独立开闭括号的插件失效——一个未配对的{' '}
+  <code>compaction/start</code>，无论写入方是崩在压缩中间、还是正在压缩，读起来都一样。
+  在 <code>session/end-seed</code> <strong>之前</strong>的开启标记来自构造种子，属于一个已经结束的生命周期。
+</Callout>
+
+要**定位最后一条** `session/end-seed`，而不是假设它出现在 `firstLiveSeq`：已经以它结尾的种子不会被重复标记，所以重新打开一个未被改动的会话不会让日志每次都增长。
+
+<Callout variant="warn" title="它不是关于其他写入方的活性信号">
+  一个并发存活的会话会把自己的边界放在别处，所以要容忍并发写入方，需要日志之外的活性信号。
+</Callout>
+
+## 持久化 seam
+
+<Figure
+  kind="架构图"
+  title="ctx.sessionPersistence 与它的耐久性契约"
+  caption={
+    <>
+      后端可以为一批事件选择自己的存储编码，只要 <code>load</code> 返回<strong>确切的已追加事件</strong>。JSONL 后端默认的打包 chunk 行就是这样一种编码。
+    </>
+  }
+>
+  <Seam
+    serviceKey="ctx.sessionPersistence"
+    definition={{
+      title: 'Durable session persistence seam',
+      sub: 'packages/session/session-persistence',
+      body: '持久日志必须无损保存每一个事件，包括 assistant/chunk——seq 必须保持连续，所以 chunk 不能从规范日志里被过滤掉。',
+    }}
+    providers={[{ title: 'session-persistence-jsonl', sub: '每个 Session 一份产物' }]}
+    consumers={[
+      { title: 'agent-loop' },
+      { title: 'tool-bash' },
+      { title: 'hooks-claude-code · hooks-codex' },
+      { title: 'session-query · session-query-sqlite' },
+      { title: 'message-feedback' },
+    ]}
+  />
+</Figure>
+
+<Callout variant="rule" title="加一个携带非序列化数据的事件类型是破坏性变更">
+  同样属于破坏性变更的还有：破坏核心执行嵌套，或违反它 owner 声明的关系。
+  <code>dsh-session</code> 只把 <code>SESSION_FORMAT_VERSION</code> 保持在 <code>0</code>，<strong>不提供兼容承诺</strong>——只有结构性格式变化才会 bump 它。
+</Callout>
+
+## projection seam
+
+`dsh-session-projection` 拥有 `ctx.sessionProjections`：注册的单元**增量地**折叠已提交事件，Host 消费者通过 `stateOf()` 读一个类型化状态，carrier 通过 `snapshot()` 批量下发裁剪后的客户端视图。
+
+<Callout variant="trap" title="不允许静默兜底">
+  Host 读取方要么在激活时<strong>要求</strong>这个服务，要么在注册表或必需 key 缺失时<strong>显式失败</strong>。
+  贡献方可以保留 <code>ctx.inject(['sessionProjections'], ...)</code> 式的注册，但不能给缺失的 host 值悄悄设默认。
+</Callout>
+
+agent-loop 为它的读取方注册共享的 `turnBoundary` 状态。`ctx.sessionProjectionCache` 则按会话**持久地记下** projection 单元状态（限流 + `turn/end`/detach 强制点），并提供冷读阶梯：缓存行 + 持久化尾部回放——这样列表页永远不需要加载完整日志。
+
+## 会话事件（`session/*`）的派发模式
+
+<DataTable
+  head={['事件', '模式', '要点']}
+  rows={[
+    ['session/created', 'emit', '同步抛错会否决并回滚（配对 dispose）；派发期间请求的 detach 会被延后'],
+    ['session/disposed', 'emit', '已公告的会话离开 store 时恰好一次；监听器失败被记录并隔离'],
+    ['session/event', 'emit', '提交后的 fire-and-forget 追加流；监听器快照在 push 之前解析，回调在之后运行'],
+    ['session/flush', 'parallel', '被 await 的持久化检查点：所有监听器都跑，调用方 await 全部，没有 waterfall 否决'],
+  ]}
+/>
+
+这四个事件都是**按 scope 过滤派发**（`@deepseek-ai/dsh-scope`）：挂在某个 agent 上的监听器只收到通过那个 agent 的 context 进入的会话/事件。

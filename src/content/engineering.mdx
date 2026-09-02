@@ -1,0 +1,358 @@
+## 六层测试
+
+<Callout variant="key" title="test:coverage 才是 CI 的覆盖率门禁，不是 test">
+  这是最容易搞错的一点。<code>pnpm run test</code> 跑单元测试；
+  <strong><code>pnpm run test:coverage</code> 才是覆盖率门禁</strong>，要求{' '}
+  <code>packages/*/*/src</code> <strong>逐文件 100%</strong>。
+</Callout>
+
+<DataTable
+  head={['层级', '命令', '它证明什么']}
+  rows={[
+    [
+      '单元',
+      'pnpm run test',
+      'vitest 跑各包与示例 tests/** 下的 spec，加上 scripts/**/*.spec.ts。测试与它所检验的代码区放在一起。每个注册表都有一个 HMR 安全测试：dispose 贡献的 fiber，断言清理完成。',
+    ],
+    [
+      '覆盖率门禁',
+      'pnpm run test:coverage',
+      '逐文件 100%。一条未覆盖的行往往是门禁替你标出的死代码，需要删除，而不是补一个测试硬凑上去。',
+    ],
+    [
+      '真实 API e2e',
+      'pnpm run test:e2e',
+      '带 key 打真实 provider API。每个 suite 在缺自己的 key 时自跳过，所以无 key 的 CI 保持绿色。',
+    ],
+    [
+      'owner 本地期望输出',
+      'pnpm run test:expected',
+      '无 key 的、装配好的 CLI/进程期望，不经过录制会话的往返。驱动用 *.expected.e2e.ts，放在 tests/expected/ 旁边。',
+    ],
+    [
+      '快照',
+      'pnpm run test:snapshot',
+      '一个顶层场景录制的 session.jsonl 同时提供用户输入与模型回放，然后作为期望的持久结果。',
+    ],
+    [
+      'Web 浏览器快照',
+      'pnpm run test:web',
+      '必需的 Linux PR 门禁。Chromium 比对 snapshots/web/ 下的会话驱动输出与 apps/web/tests/expected/ 下的纯 UI 输出。',
+    ],
+  ]}
+/>
+
+<Callout variant="trap" title="行覆盖率必要，但不够">
+  它只证明<strong>行跑过了</strong>，不证明<strong>这个特性按发布形态工作</strong>。
+</Callout>
+
+`packages/shell/pwsh-local/src` 的逐文件 100% 需要一个真实的 `pwsh`：没有它，执行器 suite 自跳过，`vitest.config.ts` 豁免该文件，让没有 pwsh 的主机保持绿色；而 CI runner 自带 pwsh 并强制完整标准。
+
+## 关于真实 API 的立场
+
+<Callout variant="key" title="我们就是 DeepSeek——不要节省真实 API 测试">
+  一个无 key 测试只证明<strong>管道通</strong>；只有带 key 的运行才证明<strong>agent 面对真实模型能工作</strong>。
+</Callout>
+
+要覆盖：写文件的 prompt、多轮对话、工具使用、流中途取消。价值最高的是**smoke 测试**——启动一个随产品发布的 `dsh` profile、发一个 prompt、然后**检查世界**。它们抓的是「单元测试全绿、产品坏了」这一类问题，而 mock 抓不到。
+
+<Callout variant="note" title="自跳过不是一个成本信号">
+  它的作用是让无密钥 CI 与没有 key 的贡献者不被卡住。
+  profile 级集成测试放在 <code>apps/cli/tests/profiles/</code>；包专属的组合与它的包测试放在一起。
+</Callout>
+
+## 三条断言纪律
+
+<Steps
+  items={[
+    {
+      title: '优先真实实现，而不是 mock',
+      body: (
+        <>
+          只 mock 昂贵或不确定的<strong>边界</strong>（LLM 适配器、网络、时钟），下游全部保持真实。
+          一个手搓的替身只能证明桥在搬字节，证明不了发布出去的那个工具按断言行为。
+        </>
+      ),
+    },
+    {
+      title: '验证世界，不是自我报告',
+      body: (
+        <>
+          一个 e2e 断言要<strong>重跑命令或从外部重读文件</strong>；对 agent 自己输出做关键词探测会让一个作弊的 agent 通过。
+          断言未被触碰的文件<strong>逐字节相同</strong>。
+        </>
+      ),
+    },
+    {
+      title: '测试真实入口路径',
+      body: (
+        <>
+          「真实入口路径」指<strong>发布出去的产物</strong>：一个包 <code>bin</code> 在<strong>纯 node</strong> 下运行构建好的{' '}
+          <code>lib/bin.js</code>，暴露 tsx 会掩盖的失败——settle 竞态、模块解析、被吞掉的加载失败。
+        </>
+      ),
+    },
+  ]}
+/>
+
+<Callout variant="warn" title="一个 guard 只有在回归能让它失败时才叫 guard">
+  对没有 <code>inject</code> 的插件（bundle / 组合插件），一个 Loader smoke 在 default 导出替换掉必需的具名导出时<strong>仍然是绿的</strong>——
+  所以要加一条显式的 <code>expect('default' in mod).toBe(false)</code> 加上一次{' '}
+  <code>unwrapExports</code> 往返断言，<strong>并且要证明它</strong>：引入回归、看它变红、再回退。
+</Callout>
+
+e2e 测试拥有自己的资源：在测试里创建，在 `afterEach` 里 dispose（**即使失败/重试/超时也要**）。共享 fixture 放在一个普通的 `tests/harness.ts` 里，**不要放在另一个 `*.e2e.ts` 里**——import 一个 spec 会重新注册它的 `describe`，把真实 API 调用翻倍。
+
+## 源码面与产物面，不能混用
+
+<Figure
+  kind="架构图"
+  title="两个平面各自的解析规则"
+  caption={
+    <>
+      每个 vitest 配置都把 vite-tsconfig-paths 指向 <code>tsconfig.base.json</code>：
+      裸的 workspace import 解析到 <code>src</code>，<strong>不会</strong>通过包 <code>exports</code> 走到构建好的{' '}
+      <code>lib/</code>——那里的过期产物会加载模块单例的第二份副本。
+    </>
+  }
+>
+  <Matrix
+    corner="平面"
+    cols={['解析方式', '什么时候消费', '前提']}
+    rows={[
+      {
+        label: '源码面',
+        cells: [
+          { label: 'tsconfig paths → src', tone: 'accent' },
+          { label: '静态门禁与测试的默认', tone: 'lime' },
+          { label: '必须在干净的树上通过', tone: 'neutral' },
+        ],
+      },
+      {
+        label: '产物面',
+        cells: [
+          { label: '包 exports → lib/', tone: 'amber' },
+          { label: '仅显式消费：lib 模式子进程与构建产物 smoke', tone: 'amber' },
+          { label: '门禁必须显式声明这个依赖', tone: 'rose' },
+        ],
+      },
+    ]}
+  />
+</Figure>
+
+子进程的启动模式也有明确规则：
+
+<DefList
+  items={[
+    {
+      term: '构建好的 lib/（默认）',
+      sig: '共享的双模启动器',
+      desc: 'CI 与有构建的测试道把每一个 profile 或 Cordis 配置子进程都从 lib/ 启动。不要为这些子进程手写 --import tsx。',
+    },
+    {
+      term: '直接用 Node 跑可擦除的 .ts',
+      sig: '不加载 Cordis 的 fixture',
+      desc: '协议与操作系统 fixture 这样跑，不经 tsx，也不经根 paths 映射。',
+    },
+    {
+      term: 'src',
+      sig: '仅当它就是被测对象',
+      desc: '只有主题是源码路径解析的测试才能选 src，而且必须在测试里写明这个契约。',
+    },
+  ]}
+/>
+
+## 什么时候必须加快照
+
+<Callout variant="rule">
+  <strong>每一个非平凡的模型可见、协议可见或人类可见的改动，都要在同一个 PR 里增加或更新一个无 key 的录制会话场景。</strong>
+  包测试、e2e、纯 mock 与理由说明<strong>都不能替代</strong>那份装配出来的转录。
+</Callout>
+
+<DataTable
+  head={['位置', '归谁']}
+  rows={[
+    ['snapshots/session/', 'headless——一次性行为'],
+    ['snapshots/sdk/', 'SDK——持久控制（TypeScript 侧）'],
+    ['snapshots/acp/', 'ACP——自动化协议行为'],
+    ['snapshots/web/', 'Web——浏览器/ARIA 证据，与同一个会话并列'],
+    ['tests/expected/', '不由录制会话驱动的期望输出，随它的 app/包/脚本，且不用 *.snapshot.ts 后缀'],
+    ['scripts/snapshots/python-sdk-single-exe/', 'Python 运行时 CI（必需门禁）'],
+  ]}
+/>
+
+<Callout variant="key" title="两个 SDK 都跟着这个循环走">
+  agent-loop、会话生命周期与 <code>SessionEventMap</code> 的改动要<strong>在同一个 PR 里</strong>更新 TypeScript 与 Python 两侧的期望输出。
+  <code>pnpm run test</code> <strong>两者都不覆盖</strong>。
+</Callout>
+
+`snapshot.yml` 声明 profile、组合/header 类别、录制策略、例外的回放或输入元数据，以及工作区事实。**类型化 token 保留父/子身份关系**；只有 header pin 拥有 prompt/schema 边车文件。一个会产生变更的场景**独立比对完整的 `workspace.expected/` 树**，而 record 与 refresh **从不重写**它。
+
+<Callout variant="trap" title="record 与 refresh 不是一回事">
+  <strong>模型转录变了</strong>用 <code>test:snapshot:record</code>；
+  <strong>回放输入仍然有效</strong>用 <code>test:snapshot:refresh</code>。
+  两种情况下都要<strong>审查每一处产生的 diff</strong>。fixture 在 macOS/Linux 上回放——
+  <strong>修 fixture，不要修 normalizer</strong>。
+</Callout>
+
+## spec 的执行环境
+
+<Callout variant="warn" title="只有进程是隔离的">
+  端口、可预测的路径、外部命名空间与继承来的子进程<strong>都不隔离</strong>。
+  fork 出来的 worker 会同时跑好几个 spec 文件，覆盖率门禁在它那个 job 里切成并发分区与其他门禁并列，自托管 runner 共享一台主机与一个卷。
+</Callout>
+
+所以：**通过它自己的 teardown 拥有每一个获取到的资源**；并且把「只有单独跑才通过」的 spec 读成**这个 spec 的缺陷**，而不是 runner 不稳定。
+
+## TypeScript 工程分面
+
+仓库使用**隔离的 Host 与 Client 聚合**。一个普通包只注册在**恰好一个**聚合里。
+
+<DataTable
+  head={['文件', '角色', '构成一个 program 吗']}
+  rows={[
+    ['tsconfig.json', '仅 solution 根：extends base、files: []、引用两个聚合。它是 tsserver 的发现入口，也是 tsx 跑 scripts/ 时的解析配置', '否'],
+    ['tsconfig.host.json', 'Host 聚合：Host 包、示例、测试、脚本、website，以及 api/remotes 的例外 Host 工程', '是'],
+    ['tsconfig.client.json', 'Client 聚合：packages/client/* 与它们的测试、apps/web，以及 api/remotes 的例外 Client 工程', '是'],
+    ['tsconfig.base.json', '共享 compilerOptions 与源码 paths 映射。也是 vitest 配置指向的解析门面：它没有 include，所以 paths 对每个导入方都生效', '否'],
+    ['tsconfig.base.client.json', '浏览器编译设置（jsx、DOM libs、types: []）', '否'],
+  ]}
+/>
+
+<Callout variant="key" title="为什么必须是两个聚合">
+  Host 与 Client <strong>两侧都在同一批 key 下对 cordis 的 <code>Context</code> 接口做声明合并，但服务不同</strong>。
+  一个同时看到两份合并的 program 会报冲突。<strong>冲突只存在于一个 <code>ts.Program</code> 内部</strong>——模块解析从不触发它——
+  所以 solution 可以同时引用两个聚合，一个 paths 门面也可以横跨两侧。
+</Callout>
+
+由此产生三条纪律：
+
+<Steps
+  items={[
+    {
+      title: 'tsconfig.base.json 不要写 include 或 files',
+      body: '它们会泄漏到每一个 extends 它的包工程里，把这个门面的全匹配范围收窄。',
+    },
+    {
+      title: '构建仓库级 ts.Program 的脚本要显式种一个聚合配置',
+      body: (
+        <>
+          <code>tsconfig.host.json</code> 或 <code>tsconfig.client.json</code>，
+          <strong>不是根 solution</strong>——把两个聚合压平成一个 program 会让 <code>Context</code> 合并冲突。
+        </>
+      ),
+    },
+    {
+      title: '新包注册在恰好一个聚合里',
+      body: '同时有 Node loader 入口与浏览器入口不构成拆分一个包的理由；一个普通 Client 插件在 Client 构建阶段就会产出两种运行时产物。',
+    },
+  ]}
+/>
+
+## 构建顺序不是任意的
+
+```sh
+tsc -b tsconfig.host.json
+tsdown --env.DSH_BUILD_FACE host
+tsc -b tsconfig.client.json
+tsdown --env.DSH_BUILD_FACE client
+pnpm run build:web
+```
+
+<Callout variant="note" title="Typert 只在 Host tsdown 期间运行">
+  它由 <code>tsconfig.host.json</code> 播种，分析 Host 类型并生成 <strong>Host 反射产物</strong>与{' '}
+  <strong>Host-for-Client 的 Remote 声明</strong>；<strong>Client tsdown 不启动 Typert</strong>。
+  因此 <code>typecheck</code> 会在 Client tsc 之前跑完整的 Host lib 阶段。
+</Callout>
+
+tsdown 只消费前一个 tsc 阶段发到 `lib/types` 的 JavaScript。两次 tsdown 都用同一个完整的 workspace 匹配——它们**既不扫描构建产物来发现 Client 包，也不维护 Host/Client 包过滤列表**。
+
+生成的 Host-for-Client Remote 声明是**故意留下的例外**：公开的 `typecheck`、`lint` 与 `doc-typecheck` 命令会先生成它们，而内部的 `*:contracts-ready` 脚本假定调用它的公开命令或调度门禁已经依赖了 Typert 合约生成或完整构建。
+
+## 主要门禁
+
+<DataTable
+  head={['命令', '检查什么']}
+  rows={[
+    ['pnpm run typecheck', 'strict: true + noImplicitAny；每一个残留的 any 都要解释为什么无法收窄'],
+    ['pnpm run lint', '代码风格与规则；用窄而有理由的例外，而不是全局关掉一条规则'],
+    ['pnpm run duplication', '跨文件的 TypeScript 克隆检测'],
+    ['pnpm run hygiene', 'publint（用构建好的 lib/*.js 校验包入口）+ workspace/包/依赖检查 + verify-node-next-types（用一个临时 NodeNext 消费者校验构建出的声明）'],
+    ['pnpm run doc-sync', '全部文档门禁；叶子清单在 scripts/run-gates.ts'],
+    ['pnpm run test:docs', '快速文档检查（不构建）'],
+    ['pnpm run website:build', 'VitePress 构建，同时兼作死链检查'],
+    ['verify-export-jsdoc', '每个模块与导出都有简洁 JSDoc；函数式导出要有 @param / @returns'],
+    ['verify-cordis-config', 'Raw/Web cordis.yml 的裸插件必须出现在它解析器 manifest 的 dependencies 里'],
+    ['verify-application-entrypoints', '拒绝任何绕过 dsh 的 Node 应用路径'],
+    ['verify-client-ui-i18n', '拒绝硬编码的客户端 UI 文案'],
+    ['verify-doc-budgets', '文档字数上限'],
+    ['verify-cordis-catalog', '生成的 Cordis 目录是新鲜的'],
+  ]}
+/>
+
+<Callout variant="rule" title="把可机械检查的不变量接到一个被执行的顶层门禁上">
+  并且要<strong>证明每一条被改动的验收路径会拒绝一个无效样例</strong>。
+</Callout>
+
+## 一个不熟悉的读者最容易低估的三条约定
+
+<Split>
+  <Panel title="注册即效果" tone="accent">
+    每一项贡献都要走 `ctx.effect()` / `ctx.on()`；一个注册表的 `register()` **返回 disposer**。
+
+    这不是风格问题——它是 HMR 与 per-agent 作用域成立的前提。
+  </Panel>
+  <Panel title="模型可见 ⟺ 已记录" tone="violet">
+    任何到达模型请求的东西都必须能从会话日志重建。
+
+    **一个新的模型可见输入需要一个会话事件。**
+  </Panel>
+</Split>
+
+<Callout variant="key" title="第三条：插件，而不是改循环">
+  新行为落在有文档的扩展点上；<strong>改 <code>agent-loop</code> 需要同时更新{' '}
+  <code>docs/architecture.md</code></strong>。
+</Callout>
+
+## Agent Note 与 PR 纪律
+
+<DefList
+  items={[
+    {
+      term: 'Agent Note',
+      sig: '非平凡改动必带，同 PR',
+      desc: '只有机械/局部的编辑豁免。已归档的 note 是冻结的：不要编辑，也不要把它们当作当前依据。',
+    },
+    {
+      term: '测试描述行为，不描述正确性',
+      sig: '改行为就改测试',
+      desc: '过时的行为要和它的测试一起改，并在 PR 里解释为什么。',
+    },
+    {
+      term: 'TODO 标记',
+      sig: 'FIXME / TODO / XXX',
+      desc: '按紧急度排序。FIXME 是应当阻塞新版本的问题——除非评审者明确同意仍可合入。',
+    },
+    {
+      term: '标签',
+      sig: '一个 kind/* + 全部相关 area/*',
+      desc: '加上原生 Issue Type。',
+    },
+    {
+      term: '历史选择',
+      sig: '有意拆开',
+      desc: '独立改动要拆开，并先修引入它的那个 PR 再传播。重写用 --force-with-lease，远端有移动就 abort，不要用裸 --force。',
+    },
+    {
+      term: 'ts type-equiv',
+      sig: '防止文档漂移',
+      desc: '把源码等价声明连同原始 JSDoc 粘进 subsystems 页面，用 ```ts type-equiv 围栏并在 scripts/type-equiv.manifest.json 里登记它镜像的源文件与符号。',
+    },
+  ]}
+/>
+
+<Callout variant="warn" title="发布前的立场：地基优于影响面">
+  在第一个打标签的版本之前，<strong>优先正确的地基而不是兼容性垫片</strong>：自由地重命名或重新分包，并更新每一处引用。
+  后端<strong>拒绝</strong>旧的磁盘格式。SQLite 用单调递增的 <code>SCHEMA_VERSION</code>；
+  <code>dsh-session</code> 把 <code>SESSION_FORMAT_VERSION</code> 保持在 <code>0</code>，<strong>不提供兼容承诺</strong>。
+</Callout>

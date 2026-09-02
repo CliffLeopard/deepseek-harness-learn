@@ -1,0 +1,11 @@
+# This file exists to make `learn/` its own pnpm workspace root.
+#
+# The surrounding repository has a pnpm-workspace.yaml of its own, and this site
+# is deliberately not one of its packages: it ships no @deepseek-ai/dsh-*
+# package, is excluded from every repository gate, and pins React 19 / Next 16
+# independently of the harness dependency graph. Without this file, pnpm would
+# walk up, resolve the repository workspace, and rewrite the repository lockfile.
+packages: []
+
+minimumReleaseAgeExclude:
+  - lucide-react@1.39.0

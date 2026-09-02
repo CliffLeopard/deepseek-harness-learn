@@ -1,0 +1,347 @@
+## 对话的词汇
+
+一段对话是若干 `Message`；一条消息是**类型化内容块**的数组。块的联合类型从 `ContentBlockMap` 展开。
+
+<DefList
+  items={[
+    { term: 'TextBlock', sig: '{ text }', desc: '可见文本。' },
+    { term: 'ReasoningBlock', sig: '思考内容', desc: '与可见文本明确区分。' },
+    { term: 'ImageBlock', sig: '持久图片附件', desc: '指向 attachment seam 里的持久引用。' },
+    { term: 'ToolCallBlock', sig: '{ id: ToolCallId, name, arguments }', desc: 'arguments 是原始 JSON 字符串。' },
+    { term: 'ToolResultBlock', sig: '{ toolCallId, content: ContentBlock[], isError? }', desc: '内容是嵌套的块数组。' },
+  ]}
+/>
+
+<Callout variant="rule" title="新增模态的门槛">
+  只有当它的<strong>适配器、UI、压缩与持久回放</strong>四条路径都尊重它时，一个新模态才能进入这个可合并扩展的 map。
+</Callout>
+
+`Message` 是被投递、持久历史与模型请求**共享的同一个**不可变表示：
+
+```ts
+interface Message {
+  /** Stable identity preserved across every representation boundary. */
+  readonly id: MessageId
+  /** Provider-neutral conversation role. */
+  readonly role: 'system' | 'user' | 'assistant'
+  /** Exact model-facing blocks. */
+  readonly content: ContentBlock[]
+  /** Required source fields supplied by the producer. */
+  readonly source: MessageSource
+}
+```
+
+## 两个独立的轴：谁产出的，和它是什么
+
+这是这一层最精巧的设计，也最容易被误用。
+
+<Callout variant="key">
+  <code>MessageSource.kind</code> 回答<strong>「这是谁产出的」</strong>；<code>form</code>{' '}
+  回答<strong>「这是什么类型的东西」</strong>。两个轴<strong>彼此独立</strong>——多个生产者可以共享一种 form，一个生产者也可以在一个会话里发出多种 form。
+</Callout>
+
+<Split>
+  <Panel title="MessageSourceMap：谁产出的" tone="accent">
+    可合并扩展的和类型，插件可以加自己的 `kind`。
+
+    - `user`：`{ kind: 'user' }`
+    - `plugin`：`{ kind: 'plugin', plugin: string }` & `ContextFormed`
+    - `model`：`ModelMessageSource`
+    - `tool`：`ToolMessageSource`
+  </Panel>
+  <Panel title="ContextForm：它是什么" tone="violet">
+    这个词只描述信息类型，**不描述怎么画**。颜色、图标、排序、默认折叠都是消费者的事，不允许进入这个联合。
+
+    - `instructions`：从工作区文件里读出、模型应当遵循的指令
+    - `catalog`：本会话可用项的目录，随变化重新发布
+    - `snapshot`：当前状态，同一生产者更晚的快照取代更早的
+    - `notice`：刚刚发生的一次性说明，不取代任何东西
+    - `relay`：另一个 agent 发给这一个的消息
+    - `recall`：从另一个会话日志里提取的材料，进入时可能已被缩减
+  </Panel>
+</Split>
+
+`ContextFormed` 用 `form` 做判别，因此**生产者无法在不提供该 form 所需字段的情况下选择这个 form**：`notice` 必须记录它的一行说明 `summary`，`snapshot` 必须记录它的 `sections`。省略 `form` 仍然合法——未声明的上下文就是有文档的默认值。
+
+## StreamChunk：原始流式协议
+
+一个流式响应会**交错**若干类型化块（文本、推理、多个工具调用）。`index` 把每个 delta 绑到它的块上；`block-end` 携带**已完整组装**的 `ContentBlock`，这样消费者不必自己重新组装 delta。
+
+```ts
+type StreamChunk =
+  | { type: 'block-start'; index: number; blockType: ContentBlockType }
+  | { type: 'text-delta'; index: number; text: string }
+  | { type: 'reasoning-delta'; index: number; text: string }
+  | { type: 'tool-call-delta'; index: number; id: ToolCallId; name?: string; argumentsDelta: string }
+  | { type: 'block-end'; index: number; block: ContentBlock }
+  | { type: 'usage'; usage: TokenUsage }
+  | { type: 'finish'; reason: FinishReason; replayState?: ReplayEnvelope }
+```
+
+<Callout variant="warn" title="它是封闭联合，switch 必须以 assertNever 结尾">
+  加一个变体会在<strong>每一个必须处理它的消费者</strong>处打断编译——这正是想要的效果。
+  这与 <code>SessionEventMap</code>（可合并扩展、必须走 default）恰好相反，不要混淆两者。
+</Callout>
+
+<Figure
+  kind="时序图"
+  scroll
+  title="一次流式响应的块交错与终止"
+  caption={
+    <>
+      顺序契约是硬的：<strong>usage 在 finish 之前，finish 之后什么都没有</strong>。适配器把两者都推迟到 provider 的流结束标记，这样一个尾随的仅 usage 块就不可能违反顺序。
+    </>
+  }
+>
+  <Sequence
+    actors={[
+      { name: 'Provider', sub: 'HTTP SSE', tone: 'neutral' },
+      { name: 'LlmAdapter', sub: 'stream()', tone: 'violet' },
+      { name: 'LlmRuntime', sub: 'ctx.llm', tone: 'accent' },
+      { name: 'BlockAssembler', sub: '折叠回块', tone: 'lime' },
+      { name: 'agent-loop', sub: '驱动', tone: 'accent' },
+    ]}
+    steps={[
+      { type: 'msg', from: 'agent-loop', to: 'LlmRuntime', label: 'stream(GenerateOptions)', tone: 'accent' },
+      { type: 'msg', from: 'LlmRuntime', to: 'LlmAdapter', label: 'llm/stream (waterfall)', tone: 'violet' },
+      { type: 'msg', from: 'LlmAdapter', to: 'Provider', label: '一次 provider 尝试', tone: 'neutral' },
+      { type: 'phase', label: '块交错' },
+      { type: 'msg', from: 'Provider', to: 'LlmAdapter', label: 'SSE 数据', style: 'return', tone: 'neutral' },
+      { type: 'msg', from: 'LlmAdapter', to: 'agent-loop', label: "block-start { index, blockType }", tone: 'violet' },
+      { type: 'msg', from: 'LlmAdapter', to: 'agent-loop', label: 'text-delta / reasoning-delta', tone: 'violet' },
+      { type: 'msg', from: 'LlmAdapter', to: 'agent-loop', label: 'tool-call-delta { argumentsDelta }', tone: 'amber' },
+      { type: 'msg', from: 'LlmAdapter', to: 'agent-loop', label: "block-end { block }", tone: 'violet' },
+      { type: 'note', label: '循环把原始 chunk 记进 assistant/chunk，同时把同一批 chunk 喂给 assembler' },
+      { type: 'msg', from: 'agent-loop', to: 'BlockAssembler', label: '同一批 chunk', tone: 'lime' },
+      { type: 'phase', label: '终止' },
+      { type: 'msg', from: 'LlmAdapter', to: 'agent-loop', label: "usage { usage }", tone: 'lime' },
+      { type: 'msg', from: 'LlmAdapter', to: 'agent-loop', label: "finish { reason, replayState? }", tone: 'rose' },
+      { type: 'msg', from: 'BlockAssembler', to: 'agent-loop', label: '组装好的内容 + usage + finish', style: 'return', tone: 'lime' },
+      { type: 'self', at: 'agent-loop', label: 'append assistant/message（带 provider 与 model）', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+## 适配器契约
+
+每个适配器**必须**遵守下面这些，每个消费者都**可以**依赖它们。
+
+<Steps
+  items={[
+    {
+      title: 'usage 在 finish 之前，finish 之后什么都没有',
+      body: '把两者都推迟到 provider 的流结束标记。',
+    },
+    {
+      title: '工具调用的 arguments 端到端保持原始 JSON 字符串',
+      body: (
+        <>
+          片段通过 <code>argumentsDelta</code> 流式传输；返回已解析对象的 provider 要在{' '}
+          <code>block-end</code> 处重新字符串化。
+        </>
+      ),
+    },
+    {
+      title: '两条被认可的错误路径，一个 LlmFailure 类型',
+      body: (
+        <>
+          失败可以从 <code>stream()</code> <strong>抛出</strong>（传输/协议错误），也可以用{' '}
+          <code>{"finish { kind: 'error' | 'aborted', failure }"}</code>{' '}
+          结束流（provider 的带内错误，适用于无法在流中间抛错的适配器）。
+        </>
+      ),
+    },
+    {
+      title: '一次适配器调用 = 一次 provider 尝试',
+      body: (
+        <>
+          适配器<strong>关闭库级重试</strong>。agent 级恢复会开启另一个持久编号的 turn；直接调用{' '}
+          <code>ctx.llm.stream()</code> 的调用方保持单次尝试。
+        </>
+      ),
+    },
+    {
+      title: 'provider 卡住在传输层被限时',
+      body: (
+        <>
+          两个随产品发布的远程适配器都暴露正有限的 <code>streamIdleTimeoutMs</code>，默认五分钟。
+          看门狗只在迭代器 <code>next()</code> 悬空时武装，整个请求用一个稳定 signal，把自己的过期映射为{' '}
+          <code>TIMEOUT</code>，并保留更早的调用方 abort 为 <code>ABORTED</code>。
+        </>
+      ),
+    },
+    {
+      title: '上下文溢出只有一个规范 code',
+      body: (
+        <>
+          两个 DeepSeek 适配器都通过 <code>isContextWindowExceededError()</code> 分类，并暴露{' '}
+          <code>CONTEXT_WINDOW_EXCEEDED</code>。<strong>消费者按 code 路由，不要按 provider 的报错原文。</strong>
+        </>
+      ),
+    },
+    {
+      title: '空完成是可重试错误，不是静默成功',
+      body: (
+        <>
+          终态 <code>stop</code> 但没有任何内容块，会被映射为 <code>finish {"{ kind: 'error' }"}</code>{' '}
+          并带规范 code <code>EMPTY_RESPONSE</code>；<code>dsh-llm-retry</code> 默认重试它。
+        </>
+      ),
+    },
+    {
+      title: '每个 provider HTTP 请求携带应用归属头',
+      body: (
+        <>
+          适配器发送 <code>attributionHeaders()</code>——也就是 <code>User-Agent</code>{' '}
+          基线——并用一个线级测试证明这一点。
+        </>
+      ),
+    },
+    {
+      title: 'replay 状态归适配器所有，但它的切分是共享词汇',
+      body: (
+        <>
+          成功的 <code>finish</code> 可以携带 <code>ReplayEnvelope</code>：不透明的响应级元数据，加上与发出的块序列对齐的可选 per-block 条目。
+          <strong>对齐规则是 harness 的词汇</strong>：组装丢掉一个块时，同一位置的条目也被丢掉。
+        </>
+      ),
+    },
+  ]}
+/>
+
+<Callout variant="trap" title="replay 状态只在同一个适配器实例上传递">
+  在后续请求里，<code>LlmRuntime</code> <strong>只有当</strong>历史 provider 与目标 provider 当前注册到<strong>完全同一个</strong>适配器实例时才传递这份状态。
+  持久内容始终说了算：读取方用不了的存储状态会让<strong>那一条消息</strong>退回成 provider 中立转换并附带一条诊断，而不是让整次请求失败。
+</Callout>
+
+## LlmFailure：可序列化的失败事实
+
+```ts
+/** Serializable provider or transport failure facts; policy decides whether they are retryable. */
+interface LlmFailure {
+  readonly message: string
+  /** Stable provider-neutral machine-routing code. */
+  readonly code: string
+  readonly status?: number
+  /** Provider-requested delay in milliseconds, when valid and available. */
+  readonly providerRetryAfterMs?: number
+  readonly requestId?: ProviderRequestId
+}
+```
+
+<Callout variant="note">
+  <code>providerRetryAfterMs</code> 是<strong>provider 请求的一个经校验的正延迟，不是一个重试决策</strong>。
+  决策属于策略层。
+</Callout>
+
+## 重试策略
+
+配置在**路由注册之前**就解析成一个不可变判别联合：
+
+<DataTable
+  head={['mode', '携带字段', '说明']}
+  rows={[
+    ["'normal'", '有限 maxRetries · retryableCodes · initialDelayMs · maxDelayMs · jitterRatio', '省略 provider 策略时使用 normal 默认的五次重试'],
+    ["'always'", '同样的必需退避字段，但没有有限上限', '分层设置里遗留的 normal-only 字段会被解析器忽略'],
+  ]}
+/>
+
+`llmRetryPolicyOf(stream)` 返回**调用选定适配器之后从服务注册处捕获的**那个值，所以之后的路由 dispose 或替换**不能改变一个飞行中失败的恢复策略**。
+
+## ctx.llm：适配器注册表 + 流式调用 API
+
+<DefList
+  items={[
+    {
+      term: 'registerAdapter(providers, adapter)',
+      sig: 'disposer',
+      desc: '注册一个适配器实例来服务一批 provider 路由。重复的 provider 路由会原子性失败。',
+    },
+    {
+      term: 'stream(options)',
+      sig: 'AsyncIterable<StreamChunk>',
+      desc: 'GenerateOptions.provider 选择已注册的适配器；GenerateOptions.model 传给那个适配器，且不必在生命周期开始时就注册。',
+    },
+    {
+      term: 'listProviders() / listModels()',
+      sig: '选择器元数据',
+      desc: '由可选的 providerInfo() 与异步 listModels() 供给。这份目录是建议，不是请求白名单——适配器仍可以接受未列出的 model id。',
+    },
+    {
+      term: 'resolveModel()',
+      sig: '异步查询',
+      desc: '返回确切模型身份，加上可选的对正确性敏感的上下文容量、适配器配置的 defaultMaxTokens，以及有序的模型自有 reasoning id 与可选部署默认值。',
+    },
+    {
+      term: 'imageRequestPricing(provider, model)',
+      sig: '同步解析',
+      desc: '解析该路由的请求图片计价，供 token 计量在每次测量时使用。实现不得做 I/O。',
+    },
+    { term: 'providerRetryPolicy(provider)', sig: 'ResolvedRetryPolicy', desc: '返回注册的重试策略值。' },
+  ]}
+/>
+
+`llm/stream` 是一个 **waterfall**，所以重试、指标、录制回放都可以作为监听器插进去，而不需要动适配器。
+
+## 上下文预算：token 计量与压缩
+
+<Figure
+  kind="架构图"
+  title="ctx.tokenMeter 与 ctx.compaction 的分工"
+  caption={
+    <>
+      计量与压缩是<strong>两个服务</strong>：计量只回答「现在有多满」，压缩才决定「扔什么」。
+      <code>ctx.tokenMeter</code> 拥有隔离的 per-session 回放折叠，压力消费者共享不可变、带修订号的测量值。
+    </>
+  }
+>
+  <Flow
+    dir="col"
+    nodes={[
+      { title: 'ctx.tokenMeter', sub: 'core（非 seam）', note: '隔离的 per-session 回放折叠', kind: 'service', tone: 'lime' },
+      { title: 'ctx.compaction', sub: 'seam', note: 'compaction-basic 是实现也是消费者', kind: 'service', tone: 'violet', edge: '压力测量' },
+      { title: 'ctx.toolResultPruner', sub: 'core', note: '无模型参与的剪枝，先于摘要', kind: 'service', tone: 'amber', edge: '可选剪枝' },
+      { title: 'surface replace', sub: 'SurfaceOp', note: '可回放的单节点 surface 替换', kind: 'store', tone: 'accent', edge: '写回日志' },
+    ]}
+  />
+</Figure>
+
+<Callout variant="key" title="没有给模型用的 compact 工具">
+  压缩不是模型能调用的东西。基础后端消费的是<strong>step 后的压力事件</strong>与
+  <strong>request-error 恢复事件</strong>；触发与决策都在策略层。
+</Callout>
+
+## 官方 DeepSeek 请求扩展
+
+`ctx.deepseekLlmApiExtensions` 是 `deepseek-official` 请求上**附加顶层字段**的 provider 专属注册表。
+
+<Pipeline
+  stages={[
+    {
+      title: '贡献插件用 register(field, provider) 声明一个字段',
+      tone: 'accent',
+      body: '每个字段由一个插件独立拥有。',
+    },
+    {
+      title: '适配器序列化完基础请求体后调用 prepare(request)',
+      tone: 'violet',
+      body: '把返回的字段合并进去，然后发 HTTP。',
+    },
+    {
+      title: '2xx 之后才运行准备好的 accept() 事务',
+      tone: 'lime',
+      body: '这样贡献方可以提交投递状态，而不会把传输或 provider 拒绝当成接受。',
+      branches: [
+        { label: '准备 / 冲突 / 接受失败', to: 'REQUEST_EXTENSION，并让模型请求失败', tone: 'rose' },
+      ],
+    },
+  ]}
+/>
+
+## 请求信封与可重建性
+
+循环从**已记下的状态**构建每个请求。`EpochHeader` 记录调用配置、标记由适配器默认值提供的字段，并通过完整的 `request/header` 快照记下渲染后的提示与**真正返回给模型的工具顺序**（由 `toolOrder` 配置，未设置时按字典序）。
+
+<Callout variant="rule" title="模型可见 ⟺ 已记录，在这里体现为一条纯函数">
+  信封 + 从日志算出的消息 ⇒ <strong>请求可以从会话日志重建</strong>。这也是为什么加一种模型看得见的输入必须先加一个会话事件。
+</Callout>

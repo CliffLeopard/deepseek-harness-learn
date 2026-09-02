@@ -1,0 +1,367 @@
+## 一句话定位
+
+DeepSeek Harness 是一个 **agent harness**：它不是模型，也不是某个具体工具，而是把「模型 + 工具 + 会话 + 策略 + 界面」组装成一个可运行产品的那层骨架。它的命令行名字是 `dsh`。
+
+它最重要的一条设计前提是：**没有一个特权内核**。模型适配器、工具注册表、会话日志、乃至 agent 主循环本身，都只是插件。扩展 `dsh` 的方式不是打补丁改内核，而是在其他插件旁边再挂一个插件。
+
+<Callout variant="key">
+  "Every part of the product is a plugin, including the model adapter, the tool registry, the
+  session log, and the agent loop itself, so each is replaceable from configuration."
+  —— <code>docs/architecture.md</code>
+</Callout>
+
+## 四条贯穿全站的硬约束
+
+这四条约束解释了后面所有章节里那些看起来「过于严格」的设计。先记住它们，后面每一章都会用到。
+
+<Cards
+  cols={2}
+  items={[
+    {
+      title: '注册即效果',
+      meta: 'ctx.effect() / ctx.on()',
+      tone: 'accent',
+      body: '任何贡献都通过 effect 注册，插件卸载时自动撤销。注册表的 register() 返回的是 disposer，不是 void。',
+    },
+    {
+      title: '模型可见 ⟺ 已记录',
+      meta: 'model-visible means logged',
+      tone: 'violet',
+      body: '任何进入模型请求的内容都必须能从会话日志重建。新增一种模型可见输入，就必须新增一个会话事件类型。',
+    },
+    {
+      title: '插件优先于改循环',
+      meta: 'plugins, not loop changes',
+      tone: 'lime',
+      body: '新行为挂在已文档化的扩展点上。要改 agent-loop 本身，必须同时更新 docs/architecture.md 的扩展点地图。',
+    },
+    {
+      title: '接缝是三个角色合在一起',
+      meta: 'capability seam',
+      tone: 'amber',
+      body: '服务定义、实现、消费者三者合起来才叫一个 seam。只写其中一个角色，等于没有做完这个能力。',
+    },
+  ]}
+/>
+
+## 分层视图
+
+从上往下看，`dsh` 是五层：产品外壳决定「以什么形态运行」，能力层决定「能做什么」，运行核心决定「循环如何推进」，框架层决定「插件如何组合」，最底下是被固定下来的 vendored 框架源码。
+
+<Figure
+  kind="架构图"
+  title="dsh 的五层结构与各层的代表包"
+  caption={
+    <>
+      每一层只依赖它下面的层。注意<strong>能力层与运行核心之间是 seam 边界</strong>：运行核心只认识服务接口，不认识具体实现，这就是把本地进程换成远程沙箱不需要改循环的原因。
+    </>
+  }
+>
+  <Layers
+    rows={[
+      {
+        title: '产品外壳',
+        meta: 'packages/bundle · api · acp · sdk · webhook',
+        tone: 'accent',
+        chips: [
+          { title: 'Web GUI', sub: 'dsh web' },
+          { title: 'Headless', sub: '--profile headless' },
+          { title: 'SDK 服务端', sub: '--profile sdk' },
+          { title: 'ACP', sub: '--profile acp' },
+          { title: 'Webhook 入口' },
+        ],
+        note: '同一个插件树，换一个 profile 就换一种应用形态。',
+      },
+      {
+        title: '能力层',
+        meta: 'packages/shell · fs · subprocess · terminal · web · lsp · skill · subagent · workflow',
+        tone: 'violet',
+        chips: [
+          { title: 'Shell / 子进程' },
+          { title: '文件系统' },
+          { title: '终端会话' },
+          { title: '网页检索' },
+          { title: 'LSP' },
+          { title: '技能' },
+          { title: '子代理' },
+          { title: '工作流' },
+        ],
+        note: '每一项都是一个 capability seam：定义 + 实现 + 消费者。',
+      },
+      {
+        title: '运行核心',
+        meta: 'packages/core · llm · compaction',
+        tone: 'lime',
+        chips: [
+          { title: 'session', sub: 'ctx.sessions' },
+          { title: 'system-prompt', sub: 'ctx.systemPrompt' },
+          { title: 'tools', sub: 'ctx.tools' },
+          { title: 'agent', sub: 'ctx.agents' },
+          { title: 'agent-loop', sub: 'ctx.agentLoop' },
+          { title: 'llm', sub: 'ctx.llm' },
+        ],
+        note: '产品 API 主干。它定义词汇与事件域，但不规定具体能力。',
+      },
+      {
+        title: '组合层',
+        meta: 'packages/boot · preset · bundle',
+        tone: 'amber',
+        chips: [
+          { title: 'Profile' },
+          { title: 'Bundle' },
+          { title: 'cordis.patch.yml' },
+          { title: 'Preset' },
+        ],
+        note: '启动时把有序的层叠成一棵插件树。改行为的第一手段在这一层。',
+      },
+      {
+        title: '框架层',
+        meta: 'vendor/ (pinned source)',
+        tone: 'rose',
+        chips: [
+          { title: 'Cordis Context' },
+          { title: '类型化事件' },
+          { title: 'Effect' },
+          { title: 'Loader' },
+        ],
+        note: 'vendored 固定源码，按 vendor/README.md 的流程同步。',
+      },
+    ]}
+  />
+</Figure>
+
+## 一次用户输入的数据流
+
+这是全站最值得先看懂的一张图。它回答：一句话从用户敲下去，到模型看到、到工具执行、到落进日志，中间经过哪些东西。
+
+<Figure
+  kind="数据流"
+  scroll
+  title="从用户输入到会话日志的主干路径"
+  caption={
+    <>
+      虚线表示<strong>算出来的</strong>，不是另存一份：模型历史每一步都由 <code>deriveMessages()</code> 从日志当场算出来。这条虚线就是「模型看得见的，日志里一定有」这条规则的落点。
+    </>
+  }
+>
+  <Flow
+    nodes={[
+      { title: '用户输入', sub: 'followup / steer', kind: 'io', tone: 'neutral' },
+      { title: 'Agent inbox', sub: 'ctx.agents', kind: 'service', tone: 'accent', edge: '入队' },
+      { title: 'agent-loop', sub: 'ctx.agentLoop', kind: 'service', tone: 'accent', edge: '唤醒' },
+      { title: 'agent/pre-step', kind: 'gate', tone: 'amber', edge: 'waterfall' },
+      { title: '提示装配', sub: 'ctx.systemPrompt', kind: 'service', tone: 'lime', edge: 'enter' },
+      { title: 'LLM 流式', sub: 'ctx.llm', kind: 'model', tone: 'violet', edge: 'agent/request' },
+      { title: '工具管线', sub: 'ctx.tools', kind: 'service', tone: 'rose', edge: 'tool/call' },
+      { title: '会话日志', sub: 'ctx.sessions', kind: 'store', tone: 'accent', edge: 'session/event' },
+    ]}
+  />
+  <Legend
+    items={[
+      { label: '服务（ctx 上的能力）', tone: 'accent', kind: 'service' },
+      { label: '决策点（waterfall）', tone: 'amber', kind: 'gate' },
+      { label: '持久存储', tone: 'accent', kind: 'store' },
+      { label: '进程/网络边界', tone: 'neutral', kind: 'io' },
+    ]}
+  />
+</Figure>
+
+## 应用形态：同一棵树，五个出口
+
+`dsh` 只有一个可执行入口。所有受支持的应用都是「`dsh` + 一个 profile 名」，这是一条被脚本强制检查的规则，而不是建议。
+
+<DataTable
+  head={['启动命令', 'profile', '形态', 'patch 重载']}
+  rows={[
+    ['dsh web', 'web', '浏览器 GUI（--profile web 的官方别名）', '实时重载'],
+    ['dsh --profile headless', 'headless', '一次性任务运行器，无服务器', '启动时一次性应用'],
+    ['dsh --profile sdk', 'sdk', 'SDK 的 JSON-RPC 服务端', '启动时一次性应用'],
+    ['dsh --profile sdk-minimal', 'sdk-minimal', '独立最小 SDK 树，不叠加 dsh-base', '启动时一次性应用'],
+    ['dsh --profile acp', 'acp', '仅自动化用途的 ACP 服务端', '启动时一次性应用'],
+  ]}
+/>
+
+<Callout variant="rule" title="应用启动规则">
+  vendored CLI、仅用于构建或测试的可执行文件、进程内直接挂载插件、以及私有的浏览器 WebWorker 预览，<strong>都不是</strong> Harness 的应用启动器。<code>scripts/verify-application-entrypoints.ts</code>
+  会把每个包的 bin、可执行源文件与根目录 demo 归入明确的类别，并拒绝任何绕过 `dsh` 的 Node 应用路径。
+</Callout>
+
+自定义组合的边界也由此确定：调用方能选择的是 **profile 名 + 有序的 patch 文件**，而不是一整棵 Cordis 树。Python SDK 与 TypeScript SDK 都遵守同一条约束。
+
+## 仓库地图
+
+`packages/` 按能力族分组，每组内部再分 `<group>/<pkg>`。看包名就能判断它在哪一层、承担 seam 的哪个角色。
+
+<Figure
+  kind="结构图"
+  title="仓库顶层目录与 packages/ 分组"
+  caption={
+    <>
+      包名一律是 <code>@deepseek-ai/dsh-&lt;name&gt;</code>；vendored 包被重新划归 scope 并标为 <code>private: true</code>。<code>@deepseek-ai/cordis</code> 是每个 harness 包的 peerDependency。
+    </>
+  }
+>
+  <Tree
+    nodes={[
+      {
+        label: 'vendor/',
+        tone: 'rose',
+        note: 'Cordis 固定源码副本，含上游 SHA 清单',
+      },
+      {
+        label: 'packages/',
+        tone: 'accent',
+        note: '所有 @deepseek-ai/dsh-* 工作区',
+        children: [
+          { label: 'core/', note: '产品 API 主干：session、system-prompt、tools、agent、agent-loop', tone: 'lime' },
+          { label: 'llm/', note: 'LLM 能力：服务定义 + DeepSeek providers', tone: 'lime' },
+          { label: 'shell/ subprocess/ terminal/ fs/ lsp/', note: '执行世界', tone: 'violet' },
+          { label: 'skill/ web/ workflow/ subagent/', note: '高层能力', tone: 'violet' },
+          { label: 'compaction/ context/ todo/ plan/', note: '上下文与状态', tone: 'violet' },
+          { label: 'api/ typert/', note: 'Remote BFF 装配与类型图生成', tone: 'accent' },
+          { label: 'bundle/ boot/ preset/', note: '组合与启动', tone: 'amber' },
+          { label: 'sdk/ acp/ webhook/ hooks/', note: '进程外集成面', tone: 'accent' },
+          { label: 'session/ settings/ credentials/ identity/', note: '持久数据与配置', tone: 'lime' },
+          { label: 'interaction/ guard/ self-modification/', note: '审批、循环卫生、自省', tone: 'rose' },
+          { label: 'e2b/ experimental/', note: '沙箱 POC 与私有原型', tone: 'neutral' },
+          { label: 'support/ util/', note: '开发与测试基础设施、零依赖工具', tone: 'neutral' },
+        ],
+      },
+      { label: 'python/', note: 'Python SDK 与打包运行时', tone: 'accent' },
+      { label: 'native/', note: 'Landlock 启动器源码', tone: 'accent' },
+      { label: 'docs/', note: '架构、生成目录、复盘、cookbook', tone: 'amber' },
+      { label: '.agents/', note: 'Agent 工作流与 Agent Notes', tone: 'amber' },
+      { label: 'scripts/', note: '仓库门禁与生成器', tone: 'neutral' },
+      { label: 'website/', note: '双语文档的 VitePress 站点', tone: 'neutral' },
+    ]}
+  />
+</Figure>
+
+## 核心概念速查
+
+下面这些词在全站反复出现，且**不可混用**。这里给最短定义，完整定义见各自章节与[术语表](/docs/glossary)。
+
+<DefList
+  items={[
+    {
+      term: 'plugin',
+      sig: 'Cordis 的组合单位',
+      desc: '一个函数或类，接收 ctx，注册服务、事件监听与 effect。卸载时它注册的一切自动撤销。',
+    },
+    {
+      term: 'profile',
+      sig: '存放在 Harness home 的命名组合',
+      desc: '列出它叠加的 bundle，容纳它安装的树外插件，并保存用户自己的 cordis.patch.yml。',
+    },
+    {
+      term: 'bundle',
+      sig: 'Cordis 配置行的分发格式',
+      desc: '带上要挂载的代码。它插入的内容仍可被上层 patch 修改。',
+    },
+    {
+      term: 'step',
+      sig: '一次模型请求 + 它引发的工具调用',
+      desc: '循环的最小推进单位。一个 step 内可能并发执行多个工具。',
+    },
+    {
+      term: 'turn',
+      sig: '零个或多个 step',
+      desc: '在第一份输入被 claim 之前开启，在不再欠任何工作时关闭。可以是零 step 的空 turn。',
+    },
+    {
+      term: 'seam',
+      sig: 'Service Definition + Provider + Consumer',
+      desc: '可替换能力的基本单位。三个角色缺一不成立。',
+    },
+    {
+      term: 'session event',
+      sig: 'SessionEventMap 的成员',
+      desc: '追加到日志的持久事实，并通过 session/event 广播。需要在重载后仍然存在的事实必须是它。',
+    },
+    {
+      term: 'scope',
+      sig: 'per-agent 注册的可见性',
+      desc: '用某个 agent 的 agent.ctx 注册，就把这份贡献限定在那个 agent 上。',
+    },
+  ]}
+/>
+
+## 三个事件域，以及为什么先选域
+
+绝大多数改动的第一个决定不是「写在哪个文件」，而是「用哪个事件域」。选错域会让功能在重载后消失，或者让循环耦合上某个策略。
+
+<Figure
+  kind="对照表"
+  title="三个事件域的用途边界"
+  caption="选择顺序：先问「这个事实需要在重载后存在吗」；再问「我需要拿到活的 Agent 吗」；否则就是能力事件。"
+>
+  <Matrix
+    corner="判据"
+    cols={['会话事件', 'Agent 事件', '能力事件']}
+    rows={[
+      {
+        label: '典型名字',
+        cells: [
+          { label: 'turn/start · user/message · tool/result', tone: 'accent' },
+          { label: 'agent/pre-step · agent/status', tone: 'violet' },
+          { label: 'fs/* · tools/* · telemetry/*', tone: 'lime' },
+        ],
+      },
+      {
+        label: '重载后是否存在',
+        cells: [
+          { label: '是，追加到日志', tone: 'accent' },
+          null,
+          null,
+        ],
+      },
+      {
+        label: '能拿到活的 Agent',
+        cells: [null, { label: '是，携带 Agent 句柄', tone: 'violet' }, null],
+      },
+      {
+        label: '是否耦合循环',
+        cells: [
+          { label: '不耦合，广播事实', tone: 'accent' },
+          { label: '可拦截在飞行中的工作', tone: 'violet' },
+          { label: '不导入循环即可挂策略', tone: 'lime' },
+        ],
+      },
+      {
+        label: '用来做什么',
+        cells: [
+          { label: '持久事实、回放、转录', tone: 'accent' },
+          { label: '观察或拦截 inbox/step/请求/校验/续跑', tone: 'violet' },
+          { label: '给 seam 挂策略与适配器', tone: 'lime' },
+        ],
+      },
+    ]}
+  />
+</Figure>
+
+## 怎么读这份图谱
+
+<Steps
+  items={[
+    {
+      title: '先把词对齐',
+      body: <>turn / step / round、seam、scope 在仓库里各有固定含义。用错词，读源码就会一直判错。先翻<a href="/docs/glossary">术语表</a>。</>,
+    },
+    {
+      title: '再看插件怎么进树',
+      body: <>第 04 章把「写一个 apply」接到「进入一次 turn」。Cordis 原语和 patch 分层都是为这件事服务的。</>,
+    },
+    {
+      title: '再读循环',
+      body: <>第 06 章的时序图是理解一切运行时行为的钥匙。读完它，你会知道每个扩展点能改变什么、不能改变什么。</>,
+    },
+    {
+      title: '按目的挑能力章节',
+      body: <>第 10 章给出 29 个可替换接缝的全景清单；找到你要改的那一行，再去读对应的第 11–13 章。</>,
+    },
+    {
+      title: '动手前看工程约定',
+      body: <>第 16 章解释哪些门禁会拦住你、需要补哪一层测试。仓库对「非平凡改动必须带 Agent Note」是硬要求。</>,
+    },
+  ]}
+/>

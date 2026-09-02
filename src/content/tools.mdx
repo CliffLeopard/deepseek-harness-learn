@@ -1,0 +1,305 @@
+## 管线为什么长这样
+
+工具是模型能做的一切事。如果把「要不要批准」「有没有超时」「结果要不要改写」「UI 怎么画」都写进循环，那么每加一种策略就要改一次 `agent-loop`。
+
+于是这些关注点被安排到**循环之外的固定位置**：
+
+<Callout variant="key">
+  <code>tools/pre-execute</code> waterfall 先跑，接着是单调 guard，然后是{' '}
+  <code>tools/execute</code> 与 <code>tools/post-execute</code> 两个 waterfall——这三个 waterfall
+  都<strong>可以变换一次调用</strong>。之后才是定义自有的 <code>finalizeContent</code> 与{' '}
+  <code>tools/result</code>。
+</Callout>
+
+## 完整执行管线
+
+<Figure
+  kind="生命周期"
+  title="从 assistant 消息里的 tool-call 块到 UI 完成卡片"
+  caption={
+    <>
+      这条线上每一个阶段都可以拒绝或改写调用，但只有<strong>一个</strong>给模型看的结果会被记进{' '}
+      <code>tool/result</code>。注意 <code>tool/call</code> 是<strong>在执行之前</strong>就记录的——所以即使工具崩溃，日志里也有它被调用过的事实。
+    </>
+  }
+>
+  <Pipeline
+    stages={[
+      {
+        title: 'assistant 消息里出现 tool-call 块',
+        tone: 'violet',
+        body: '模型决定调用工具。此时还没有任何副作用。',
+      },
+      {
+        title: '记录 tool/call 会话事件',
+        sub: 'logged before execution',
+        tone: 'accent',
+        body: '同时 UI 画出 pending 卡片，用的是定义自带的 presentCall(args)。',
+      },
+      {
+        title: 'tools/pre-execute waterfall',
+        sub: 'hooks, permission, sandbox',
+        tone: 'amber',
+        body: '通用的前置 waterfall。hook 桥、审批策略、沙箱包裹都挂在这里。',
+        branches: [
+          { label: 'deny', to: '跳过工具体，直接进 post', tone: 'rose' },
+          { label: 'ask', to: 'ctx.approval 一次性提示', tone: 'amber' },
+          { label: 'throw', to: '注册表外层归一化', tone: 'rose' },
+        ],
+      },
+      {
+        title: 'ctx.approval 一次性提示',
+        sub: '在单调 guard 之前解析',
+        tone: 'amber',
+        body: '服务缺失或无法作答一律视为拒绝——这是 fail-closed。',
+        branches: [
+          { label: 'allowed-once', to: '继续到 guard', tone: 'lime' },
+          { label: 'rejected / cancelled / unavailable', to: 'denied', tone: 'rose' },
+        ],
+      },
+      {
+        title: '已注册的单调 guard',
+        sub: 'deny 或 abstain；identity protected',
+        tone: 'rose',
+        body: 'guard 只能拒绝或弃权，不能放宽。「不可被重排」的 owner 策略必须写成 guard，而不是 waterfall 监听器。',
+        branches: [{ label: 'deny', to: 'denied', tone: 'rose' }],
+      },
+      {
+        title: 'tools/execute waterfall',
+        sub: '环绕派发：timeout, retry, metrics',
+        tone: 'violet',
+        body: '这是「环绕」层。超时这类横切关注点包在这里，而不是写进每个工具。',
+      },
+      {
+        title: '已注册工具的 execute() 主体',
+        tone: 'lime',
+        body: (
+          <>
+            真正干活的地方。工具内部的文件改动会经过 <code>fs/write-intent</code> 或{' '}
+            <code>fs/edit-intent</code>（仅 tool-fs 的变更），并可能发出工具自有的会话事件。
+          </>
+        ),
+      },
+      {
+        title: 'tools/post-execute waterfall',
+        sub: 'accept, block, replace, add context',
+        tone: 'amber',
+        body: '这里可以接受、拦截、整体替换结果，或追加额外上下文。',
+      },
+      {
+        title: '注册表外层归一化',
+        sub: 'pipeline / result snapshot throws → isError',
+        tone: 'neutral',
+        body: '注册表先无损快照候选结果；快照失败会被归一化成 isError，而不是把异常抛给循环。',
+      },
+      {
+        title: 'ToolDefinition.finalizeContent',
+        sub: '最后一次「只改内容」的不变量',
+        tone: 'lime',
+        body: '同步、只允许改内容。定义自己拥有这一步，用来强制它对内容的约束。',
+      },
+      {
+        title: 'tools/result 同步通知',
+        sub: '冻结后真正生效的结果',
+        tone: 'accent',
+        body: '观察不可变、无损 JSON 的最终结果。它是通知，不是决策点。',
+      },
+      {
+        title: '记录 tool/result 会话事件',
+        sub: '唯一给模型看的结果',
+        tone: 'accent',
+        body: 'UI 随之画出完成卡片 presentResult(args, result)。',
+      },
+      {
+        title: '批次结算后处理 additionalContexts',
+        sub: 'FIFO',
+        tone: 'violet',
+        body: '活动批次的 additionalContexts 按 FIFO 注入为 user/message，位置在已记录的工具结果之后。',
+      },
+    ]}
+  />
+</Figure>
+
+## 三个决策点的返回语义
+
+<DataTable
+  head={['阶段', '可返回', '效果']}
+  rows={[
+    ['tools/pre-execute', 'allow / deny / ask', 'deny 跳过工具体；ask 交给 ctx.approval'],
+    ['ctx.approval', 'allowed-once / rejected / cancelled / unavailable', '只有 allowed-once 继续；其余全部 denied'],
+    ['guard', 'deny / abstain', '只能收紧，不能放宽；identity 受保护'],
+    ['tools/post-execute', 'accept / block / replace / add context', '拦截、替换结果，或追加上下文'],
+  ]}
+/>
+
+<Callout variant="warn" title="ctx.approval 缺失 = 拒绝">
+  「absent or unanswerable: deny」是写在管线图里的字面规则。也就是说，一个没有审批服务的组合<strong>不会</strong>默默放行需要审批的工具。
+</Callout>
+
+## guard 和 waterfall 的分工
+
+这是这一层最容易做错的设计决定。
+
+<Split>
+  <Panel title="用 waterfall（tools/pre-execute）" tone="accent">
+    - 能跨工具族的通用策略：hook 桥、权限、沙箱包裹
+    - 需要变换调用参数
+    - 可以被其他监听器重排、包装
+
+    它的位置在 approval **之前**。
+  </Panel>
+  <Panel title="用 guard" tone="rose">
+    - owner 策略，**不允许被重排**
+    - 只需要「拒绝或弃权」这两种表达
+    - 需要 identity 保护（调用者身份不可被伪造）
+
+    它的位置在 approval **之后**。
+  </Panel>
+</Split>
+
+## 并发：exclusive 与 parallel
+
+一个 step 里可能有多个工具调用。循环按 `executionMode` 给待执行调用分类，然后在**屏障 + 有界滚动池**里推进，并且在每个调用真正开始前**重新分类一次**。
+
+<Figure
+  kind="生命周期"
+  title="工具批次的执行顺序：pre 有序，execute 并发，post 按模型顺序"
+  caption={
+    <>
+      三个阶段的顺序性不同：<strong>pre 有序</strong>（策略需要确定性）、<strong>execute 并发</strong>（吞吐）、
+      <strong>post 按模型给出的调用顺序</strong>（结果对齐）。理解这三者不同，才能解释为什么并发执行不会打乱结果顺序。
+    </>
+  }
+>
+  <Flow
+    dir="col"
+    nodes={[
+      { title: '按 executionMode 分类', sub: 'exclusive / parallel', kind: 'gate', tone: 'amber' },
+      { title: '屏障 + 有界滚动池', note: '每次启动前重新分类', kind: 'plain', tone: 'violet', edge: '调度' },
+      { title: '有序 pre', kind: 'plain', tone: 'accent', edge: '逐个' },
+      { title: '并发 execute', kind: 'plain', tone: 'lime', edge: '同时' },
+      { title: '按模型顺序 post', kind: 'plain', tone: 'accent', edge: '下一个就绪结果' },
+      { title: 'tool/result', kind: 'store', tone: 'accent', edge: '记录' },
+    ]}
+  />
+</Figure>
+
+## ToolDefinition 的关键字段
+
+<DefList
+  items={[
+    {
+      term: 'execute',
+      sig: '工具主体',
+      desc: '真正干活的函数。它内部的文件变更会经过 fs/* 意图事件。',
+    },
+    {
+      term: 'finalizeContent',
+      sig: '同步，只改内容',
+      desc: '管线最后一次「只改内容」的机会，由定义自己拥有，用来强制它自己的内容不变量。',
+    },
+    {
+      term: 'timeoutMs',
+      sig: '超时',
+      desc: (
+        <>
+          超时是<strong>环绕关注点</strong>，包在 <code>tools/execute</code> 上，而不是写进 execute 主体。
+        </>
+      ),
+    },
+    {
+      term: 'isConcurrencySafe',
+      sig: '并发安全声明',
+      desc: '决定这个调用能否进入并发池，还是必须独占。',
+    },
+    {
+      term: 'presentCall(args)',
+      sig: 'UI pending 卡片',
+      desc: '在 tool/call 记录之后立刻用于渲染「正在执行」的卡片。',
+    },
+    {
+      term: 'presentResult(args, result)',
+      sig: 'UI 完成卡片',
+      desc: '在 tool/result 记录之后渲染最终卡片。Host presenter 保持纯函数。',
+    },
+  ]}
+/>
+
+<Callout variant="rule" title="Host presenter 必须是纯的">
+  工具的 UI 呈现要<strong>提前设计</strong>：Host presenter 保持纯函数；Web 卡片从原始事件与持久化的结果元数据算出来。见{' '}
+  <code>docs/cookbook/adding-a-tool.md</code>。
+</Callout>
+
+## PTC 模式：run_code 作为传输层
+
+PTC（Program Through Code）模式让模型用一段代码表达一批工具调用。它的关键在于**不绕过管线**。
+
+<Figure
+  kind="数据流"
+  title="run_code 与它序列化出的子调用都走同一条管线"
+  caption={
+    <>
+      子调用携带<strong>父 token</strong>、记录 <code>tool/code-dispatch</code>、把拒绝作为<strong>有约束力的 rejection</strong> 返回，并且<strong>省略 additionalContexts</strong>——后者是为了保持 call 与 result 的相邻性。
+    </>
+  }
+>
+  <Flow
+    dir="col"
+    nodes={[
+      { title: '模型调用保留名 run_code', sub: 'reserved transport', kind: 'gate', tone: 'violet' },
+      { title: '完整工具管线', note: 'run_code 本身也过一遍', kind: 'plain', tone: 'amber', edge: '同一条管线' },
+      { title: '序列化出的子调用', sub: '携带父 token', kind: 'plain', tone: 'rose', edge: '逐个派发' },
+      { title: 'tool/code-dispatch', kind: 'store', tone: 'accent', edge: '记录' },
+      { title: '拒绝 = 有约束力的 rejection', note: '不是「建议」，子调用必须服从', kind: 'plain', tone: 'rose', edge: 'deny 时' },
+    ]}
+  />
+</Figure>
+
+## 事件清单
+
+<DataTable
+  head={['事件', '模式', '位置与用途']}
+  rows={[
+    ['tool/call', 'emit（会话事件）', '执行之前记录，UI 据此画 pending 卡片'],
+    ['tools/pre-execute', 'waterfall', '通用前置：hook、权限、沙箱'],
+    ['tools/execute', 'waterfall', '环绕派发：超时、重试、指标'],
+    ['tools/post-execute', 'waterfall', '接受 / 拦截 / 替换 / 追加上下文'],
+    ['tools/result', '同步通知', '观察冻结后真正生效的结果，不是决策点'],
+    ['tool/result', 'emit（会话事件）', '唯一给模型看的结果'],
+    ['tool/code-dispatch', 'emit（会话事件）', 'PTC 子调用的派发记录'],
+    ['fs/write-intent · fs/edit-intent', '能力事件', '仅 tool-fs 的变更经过；read-before-edit 检查在 tool-fs 之下'],
+  ]}
+/>
+
+## 新增一个工具时要一起做的事
+
+<Steps
+  items={[
+    {
+      title: '定义 + 注册',
+      body: (
+        <>
+          在 <code>ctx.tools</code> 上注册；它的 schema 会自动加入提示装配。<code>register()</code>{' '}
+          返回 disposer。
+        </>
+      ),
+    },
+    {
+      title: '设计 UI 呈现',
+      body: (
+        <>
+          <code>presentCall</code> / <code>presentResult</code>{' '}
+          要在这一步就定下来，而不是事后补。Host presenter 纯函数，Web 卡片从事件与持久化元数据算出来。
+        </>
+      ),
+    },
+    {
+      title: '规划三层测试',
+      body: '为能力接缝、生命周期路径与转录输出分别规划单元、e2e 与快照覆盖。缺少的快照工具支持要在同一个改动里补上。',
+    },
+    {
+      title: '更新快照',
+      body: '任何非平凡的、模型可见或产品用户可见的改动，都要更新一份无密钥的录制会话快照。两个 SDK 的期望输出也要在同一个 PR 里更新。',
+    },
+  ]}
+/>

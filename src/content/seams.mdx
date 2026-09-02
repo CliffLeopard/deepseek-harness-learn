@@ -1,0 +1,259 @@
+## 三个角色
+
+<Callout variant="key">
+  一个 seam 由<strong>服务定义</strong>（声明接口）、<strong>服务实现</strong>（实现它）与
+  <strong>消费者</strong>（使用它，通常是一个给模型用的工具）三个角色构成。
+  一个包可以兼任多个角色，但<strong>单独一个角色不叫 seam</strong>；新增一项能力意味着把三个角色都设计出来。
+</Callout>
+
+<Figure
+  kind="结构图"
+  title="以 ctx.shell 为例：三个角色如何分工"
+  caption={
+    <>
+      注意消费者<strong>不知道</strong>自己跑在哪个执行器上。把 <code>bash-local</code> 换成{' '}
+      <code>bash-sandbox</code> 或 <code>pwsh-local</code>，<code>tool-bash</code> 与 hook
+      桥一行都不用改——这就是 seam 的全部价值。
+    </>
+  }
+>
+  <Seam
+    serviceKey="ctx.shell"
+    definition={{
+      title: 'Bash executor seam',
+      sub: 'packages/shell/shell',
+      body: '声明「执行一段 shell」的接口，不含任何执行方式。',
+    }}
+    providers={[
+      { title: 'bash-local', sub: '通过 ctx.subprocess 本地 spawn' },
+      { title: 'bash-sandbox', sub: '受 ctx.sandbox 约束后再 spawn' },
+      { title: 'pwsh-local', sub: 'Windows 无沙箱' },
+      { title: 'pwsh-sandbox', sub: 'Windows 沙箱消费' },
+    ]}
+    consumers={[
+      { title: 'tool-bash', sub: '给模型用的 shell 工具' },
+      { title: 'tool-pwsh', sub: '给模型用的 pwsh 工具' },
+      { title: 'hooks-claude-code', sub: 'Claude Code hook 桥' },
+      { title: 'hooks-codex', sub: 'Codex hook 桥' },
+    ]}
+  />
+</Figure>
+
+## 为什么换一个实现就改变整个产品
+
+<Callout variant="note" title="来自 docs/architecture.md">
+  "Filesystem and subprocess providers share one execution world, so pointing them at a remote
+  sandbox moves Bash, PTY, and LSP with them, with no provider forks."
+</Callout>
+
+文件系统与子进程的实现**共享同一个执行世界**。把它们指向一个远程沙箱，Bash、PTY 与 LSP 会一起跟着搬过去，而且不需要为任何 provider 开分支。
+
+<Figure
+  kind="数据流"
+  scroll
+  title="把执行世界从本地换到 E2B：只替换两个 provider"
+  caption={
+    <>
+      <code>ctx.e2b</code> 拥有一个共享的 E2B SDK 句柄、远程工作目录与最终的沙箱处置，因此{' '}
+      <code>fs-e2b</code> 与 <code>subprocess-e2b</code> 两个基础 provider 一定生活在<strong>同一个 Linux 运行时</strong>里。
+    </>
+  }
+>
+  <Flow
+    nodes={[
+      { title: 'tool-bash / tool-fs / tool-lsp', sub: '消费者', kind: 'plain', tone: 'neutral' },
+      { title: 'ctx.shell · ctx.fs · ctx.lsp', sub: '服务定义', kind: 'service', tone: 'accent', edge: '按 key 调用' },
+      { title: 'ctx.subprocess', sub: '共享的执行世界', kind: 'service', tone: 'violet', edge: 'spawn' },
+      { title: 'subprocess-e2b + fs-e2b', sub: '替换掉的实现', kind: 'plugin', tone: 'lime', edge: '换实现' },
+      { title: 'ctx.e2b', sub: '共享 SDK 句柄 / 远程 cwd', kind: 'service', tone: 'amber', edge: '共用' },
+      { title: 'E2B Linux 沙箱', kind: 'io', tone: 'neutral', edge: '远程' },
+    ]}
+  />
+</Figure>
+
+## 29 个可替换接缝的完整清单
+
+下表来自生成目录 `docs/capability-seams.md`，只保留 role 为 `seam` 的行。**服务定义**列是拥有该接口的包，**实现**列里的每一项都可以互换。
+
+<DataTable
+  head={['ctx key', '服务定义', '实现', '主要消费者']}
+  rows={[
+    ['ctx.llm', 'llm/llm', 'llm-deepseek · llm-pi-ai · llm-replay', 'agent-loop · compaction-basic'],
+    ['ctx.fs', 'fs/fs', 'fs-local · fs-sandbox · fs-e2b', 'tool-fs'],
+    ['ctx.subprocess', 'subprocess/subprocess', 'subprocess-local · subprocess-e2b', 'bash-local · bash-sandbox · terminal-bash · lsp-stdio · subagent-acp/codex/claude-code'],
+    ['ctx.shell', 'shell/shell', 'bash-local · bash-sandbox · pwsh-local · pwsh-sandbox', 'tool-bash · tool-pwsh · hooks-claude-code · hooks-codex'],
+    ['ctx.terminals', 'terminal/terminal', 'terminal-bash', 'tool-terminal'],
+    ['ctx.sandbox', 'sandbox/sandbox', 'sandbox-local', 'bash-sandbox · pwsh-sandbox · terminal-bash · fs-sandbox'],
+    ['ctx.lsp', 'lsp/lsp', 'lsp-stdio', 'tool-lsp'],
+    ['ctx.codeRuntime', 'code-runtime/code-runtime', 'code-runtime-worker-thread · experimental-code-runtime-python', 'tools（PTC 模式）'],
+    ['ctx.subagents', 'subagent/subagent', 'spawn-in-process · fork-in-process · acp · codex · claude-code · dsh-sdk', 'tool-subagent · tool-subagent-control · tool-ralph'],
+    ['ctx.workflowEngine', 'workflow/workflow', 'workflow-worker-thread', 'tool-workflow · tool-ralph'],
+    ['ctx.jobs', 'jobs/jobs', 'jobs-local', 'tool-bash · tool-terminal · tool-subagent · tool-jobs'],
+    ['ctx.web', 'web/web', 'web-search-exa · web-search-perplexity · web-search-deepseek · web-fetch-http', 'tool-web'],
+    ['ctx.skills', 'skill/skill', 'skill-badge · skill-filesystem', 'tool-skill'],
+    ['ctx.compaction', 'compaction/compaction', 'compaction-basic', 'compaction-basic'],
+    ['ctx.approval', 'interaction/user-approval', '（监听器充当应答者）', 'tools · tool-bash · acp'],
+    ['ctx.userQuestions', 'interaction/user-questions', '（UI 前端提供）', 'tool-ask-user'],
+    ['ctx.sessionPersistence', 'session/session-persistence', 'session-persistence-jsonl', 'agent-loop · tool-bash · hooks-* · session-query · message-feedback'],
+    ['ctx.sessionQuery', 'session-query/session-query', 'session-query-sqlite', 'session-reference · tool-session-query'],
+    ['ctx.sessionTitle', 'session/session-title', 'first-prompt-llm · all-prompts-llm', '（无直接消费者）'],
+    ['ctx.sessionTelemetry', 'session/session-telemetry', 'session-telemetry-otel', '（输出离开进程）'],
+    ['ctx.settings', 'settings/settings', 'settings-file', 'api-settings-controller · llm-deepseek · llm-pi-ai'],
+    ['ctx.credentials', 'credentials/credentials', 'credentials-local', 'api-settings-controller · llm-deepseek · llm-pi-ai'],
+    ['ctx.authorization', 'credentials/authorization', '（由知道如何取凭据的插件注册流程）', 'llm-pi-ai'],
+    ['ctx.storage', 'storage/storage', 'storage-json · storage-sqlite', 'storage-domain'],
+    ['ctx.attachments', 'attachment/attachment', 'attachment-local', 'api-session-controller · tool-fs · llm-pi-ai · llm-deepseek'],
+    ['ctx.fileReferences', 'context/file-reference', 'file-reference-local', 'api-session-controller'],
+    ['ctx.spillStore', 'spill/spill', 'spill-local', 'spill-policy'],
+    ['ctx.directoryPicker', 'host/directory-picker', 'directory-picker-native · directory-picker-browse', 'api-workspace-controller'],
+    ['ctx.deepseekLlmApiExtensions', 'llm/deepseek-llm-api-extensions', 'session-log-deepseek · plugin-package-inventory-deepseek', 'llm-deepseek'],
+  ]}
+/>
+
+<Callout variant="note" title="这张表是生成的">
+  清单来源是 <code>docs/capability-seams.md</code>，由 <code>scripts/gen-doc-graphs.ts</code>{' '}
+  从 Cordis 声明里发现服务，并在脚本里对「接口 / 实现 / 消费者」三种角色做分类，缺角色就报错。
+  也就是说：<strong>漏掉一个角色会被门禁发现</strong>。
+</Callout>
+
+## seam 与「核心 spine 服务」的区别
+
+生成目录把服务分成三类 role，混淆它们会导致设计错位。
+
+<Figure
+  kind="对照表"
+  title="core / seam / bundle 三种 role"
+  caption={
+    <>
+      判据很实用：<strong>如果有第二个合理的实现方式，它就应该是 seam</strong>；如果它是唯一真相的持有者，它就是 core。
+    </>
+  }
+>
+  <Matrix
+    corner="role"
+    cols={['含义', '例子', '能不能换实现']}
+    rows={[
+      {
+        label: 'core',
+        cells: [
+          { label: '核心 spine 服务：唯一真相持有者', tone: 'accent' },
+          { label: 'ctx.sessions · ctx.tools · ctx.systemPrompt · ctx.agents · ctx.goals', tone: 'neutral' },
+          { label: '不能，它就是定义本身', tone: 'rose' },
+        ],
+      },
+      {
+        label: 'seam',
+        cells: [
+          { label: '可替换能力：定义 + 实现 + 消费者', tone: 'lime' },
+          { label: 'ctx.shell · ctx.fs · ctx.subagents · ctx.llm', tone: 'neutral' },
+          { label: '能，这正是它存在的理由', tone: 'lime' },
+        ],
+      },
+      {
+        label: 'bundle',
+        cells: [
+          { label: '组合点', tone: 'amber' },
+          { label: 'ctx.agentLoop（唯一的具体循环插件）', tone: 'neutral' },
+          { label: '通过组合层替换，不通过注册', tone: 'amber' },
+        ],
+      },
+    ]}
+  />
+</Figure>
+
+<Callout variant="trap" title="ctx.agentLoop 的 role 是 bundle，不是 seam">
+  它是<strong>那一个</strong>具体的循环插件。扩展包应当依赖 <code>dsh-agent</code>{' '}
+  的事件与服务，<strong>而不是依赖 agent-loop 这个包</strong>。这条约束保证「换掉循环驱动」不会连带撕裂整个生态。
+</Callout>
+
+## 沙箱：一个 seam 如何约束另一个 seam
+
+`ctx.sandbox` 的用法与其他 seam 不同：消费者**把自己即将 spawn 的确切 argv 交出去**，同世界的后端在一个 per-call 策略下把它包起来，并报告实施结果。
+
+<Flow
+  dir="col"
+  nodes={[
+    { title: 'bash-sandbox / terminal-bash', sub: '消费者', kind: 'plain', tone: 'neutral' },
+    { title: 'ctx.sandbox', sub: '交出即将执行的 argv', kind: 'service', tone: 'rose', edge: 'confine(argv)' },
+    { title: 'sandbox-local', sub: '同世界后端', kind: 'plugin', tone: 'amber', edge: '包裹' },
+    { title: '被包裹的 argv + 实施报告', kind: 'plain', tone: 'lime', edge: '返回' },
+    { title: 'ctx.subprocess spawn', kind: 'io', tone: 'neutral', edge: '真正执行' },
+  ]}
+/>
+
+`ctx.sandboxPolicy` 是**部署默认模式 + 工作区根**的唯一归属地。只有受沙箱约束的执行器与 provider 读这个服务（工具层用它同时导出的纯 `sandbox/mode` fold）。两个会实施约束的族——bash 与 fs——都读同一个 policy，**所以它们不可能约束到不同的根**。
+
+<Callout variant="rule" title="permission preset 是给用户看的一张表">
+  <code>ctx.permissionPresets</code> 提供 <code>workspace-write</code> 与{' '}
+  <code>danger-full-access</code> 两个预设，把沙箱模式与审批策略两个旋钮捆在一起。
+  切换预设会写一条 <code>permission/preset</code> 事件，并贯穿到两个旋钮各自的事件。
+</Callout>
+
+## 一些容易被当成 seam 的东西
+
+<Cards
+  cols={2}
+  items={[
+    {
+      title: 'ctx.sandboxPolicy',
+      meta: 'role: core',
+      tone: 'amber',
+      body: '它是策略的唯一归属地，不是可替换实现。换沙箱换的是 ctx.sandbox 的后端。',
+    },
+    {
+      title: 'ctx.e2b',
+      meta: 'role: core',
+      tone: 'amber',
+      body: '它拥有一个共享的 E2B 句柄与远程工作目录，供 fs-e2b / subprocess-e2b 两个真正的 seam 实现共用。',
+    },
+    {
+      title: 'ctx.agentTeams',
+      meta: 'role: core（实验性、私有 opt-in）',
+      tone: 'rose',
+      body: '在可续跑子代理之上叠加持久名册、任务看板与信箱的协调域。',
+    },
+    {
+      title: 'ctx.sessionProjections',
+      meta: 'role: core（强制 seam 语义）',
+      tone: 'violet',
+      body: 'Host 读取方要么在激活时要求这个服务，要么在注册表或必需 key 缺失时显式失败——不允许静默兜底。',
+    },
+  ]}
+/>
+
+## 新增一个 seam 的检查清单
+
+<Steps
+  items={[
+    {
+      title: '写服务定义',
+      body: '声明接口，不含任何实现细节。定义包同时是这个 seam 的 owner。',
+    },
+    {
+      title: '至少写一个实现',
+      body: (
+        <>
+          实现里做<strong>显式的 resolve 步骤</strong>把 request 变成 spec，再执行 spec。
+          不要在 <code>run()</code> 里藏 <code>?? default</code>。
+        </>
+      ),
+    },
+    {
+      title: '写至少一个消费者',
+      body: '通常是一个给模型用的工具。消费者不应知道它跑在哪个实现上。',
+    },
+    {
+      title: '决定要不要发布 ./invariant',
+      body: (
+        <>
+          只有当<strong>独立观察可能出现分歧</strong>时才发布运行时不变量；否则连源文件与接线一起省掉，并在 README 里记下原因。
+          空安装器、检查服务是否存在、检查插件元数据/effect/固定样例都是<strong>无效</strong>的不变量。
+        </>
+      ),
+    },
+    {
+      title: '规划三层测试',
+      body: '能力接缝、生命周期路径与转录输出各自需要单元、e2e 与快照覆盖。',
+    },
+  ]}
+/>
